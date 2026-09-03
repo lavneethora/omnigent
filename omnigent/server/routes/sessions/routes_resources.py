@@ -1566,6 +1566,7 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
+        from omnigent.inner.native_attachments import workspace_materialize_upload_limit
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
@@ -1598,7 +1599,15 @@ def register_resources_routes(
             if ext_type is not None:
                 content_type = ext_type
                 type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
+        upload_cap = None if type_limit is None else min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+        if upload_cap is None:
+            # Office documents, archives, and databases aren't inlinable, but a
+            # filesystem-capable harness reads them off disk (see
+            # native_attachments.materialize_attachment_to_workspace). Store
+            # them under their own cap; the global ceiling only backstops
+            # base64 request inflation, which this path never incurs.
+            upload_cap = workspace_materialize_upload_limit(file.filename)
+        if upload_cap is None:
             raise HTTPException(
                 status_code=415,
                 detail=(
@@ -1606,7 +1615,7 @@ def register_resources_routes(
                     "PDF, and text/code files can be attached."
                 ),
             )
-        read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+        read_limit = upload_cap
         filename = file.filename
         if content_type in _COMPRESSIBLE_IMAGE_MIMES:
             # Compressible images carry the large cap and the decode, so they are
