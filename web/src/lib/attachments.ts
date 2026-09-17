@@ -36,15 +36,6 @@ const UNCOMPRESSED_IMAGE_LIMIT_MB = 5;
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
 
-/**
- * Categories delivered by writing the file into the session's workspace
- * instead of inlining it into the model context. Used to label the chip so
- * the user knows the agent will open the file from disk.
- */
-export function isWorkspaceDelivered(category: AttachmentCategory): boolean {
-  return category === "workspace";
-}
-
 const attachmentIds = new WeakMap<File, string>();
 let nextAttachmentId = 0;
 
@@ -142,8 +133,8 @@ const TEXT_CODE_EXTENSIONS = new Set([
 // opens from the workspace rather than the model context. Extension-based
 // because these are zip containers the browser routinely mislabels as
 // application/zip or application/octet-stream. Mirrors
-// _WORKSPACE_MATERIALIZE_EXTENSIONS in omnigent/inner/native_attachments.py
-// — keep in sync.
+// _WORKSPACE_MATERIALIZE_EXTENSIONS in omnigent/inner/native_attachments.py;
+// keep in sync.
 const WORKSPACE_MATERIALIZE_EXTENSIONS = new Set([
   ".zip",
   ".docx",

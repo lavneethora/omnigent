@@ -244,8 +244,8 @@ def workspace_attachment_denied_extensions() -> frozenset[str]:
 
     Config key ``workspace_attachment_denied_extensions``, a list of
     extensions with or without the leading dot (``[".zip", "docx"]``).
-    Lets an operator narrow the built-in allowlist — e.g. deny archives
-    while still accepting office documents — without a code change.
+    Lets an operator narrow the built-in allowlist (e.g. deny archives
+    while still accepting office documents) without a code change.
     Unparseable entries are skipped rather than failing the upload path.
     """
     raw = load_server_config().get("workspace_attachment_denied_extensions")
@@ -253,7 +253,7 @@ def workspace_attachment_denied_extensions() -> frozenset[str]:
         return frozenset()
     if not isinstance(raw, list):
         logger.warning(
-            "server config workspace_attachment_denied_extensions=%r is not a list — ignoring",
+            "server config workspace_attachment_denied_extensions=%r is not a list, ignoring",
             raw,
         )
         return frozenset()
@@ -262,7 +262,7 @@ def workspace_attachment_denied_extensions() -> frozenset[str]:
         if not isinstance(entry, str) or not entry.strip():
             logger.warning(
                 "server config workspace_attachment_denied_extensions entry %r is not a "
-                "non-empty string — skipping",
+                "non-empty string, skipping",
                 entry,
             )
             continue

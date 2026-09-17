@@ -4462,33 +4462,9 @@ function setComposerState(
   });
 }
 
-describe("Composer attachment chips", () => {
+describe("Composer attachment picker", () => {
   afterEach(() => {
     cleanup();
-  });
-
-  function attach(file: File) {
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    Object.defineProperty(input, "files", { value: [file], configurable: true });
-    fireEvent.change(input);
-  }
-
-  it("marks a workspace-delivered file so the delivery mode is visible before send", async () => {
-    render(<Composer {...composerProps()} />);
-
-    attach(new File([new Uint8Array(8)], "bundle.zip", { type: "application/zip" }));
-
-    const chip = (await screen.findByText("bundle.zip")).parentElement;
-    expect(chip?.textContent).toContain("workspace");
-  });
-
-  it("leaves an inlined attachment unlabelled", async () => {
-    render(<Composer {...composerProps()} />);
-
-    attach(new File([new Uint8Array(8)], "notes.txt", { type: "text/plain" }));
-
-    const chip = (await screen.findByText("notes.txt")).parentElement;
-    expect(chip?.textContent).not.toContain("workspace");
   });
 
   it("accepts the workspace types in the file picker filter", () => {

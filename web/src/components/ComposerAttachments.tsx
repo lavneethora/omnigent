@@ -16,7 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import { attachmentKey, classifyAttachment, isWorkspaceDelivered } from "@/lib/attachments";
+import { attachmentKey, classifyAttachment } from "@/lib/attachments";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { cn } from "@/lib/utils";
 
@@ -161,8 +161,7 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
   const Icon = iconForFile(file);
   // Archives, office documents and databases go to the session workspace for
   // the agent to open rather than into the model context; say so on the card.
-  const category = classifyAttachment(file);
-  const toWorkspace = category !== null && isWorkspaceDelivered(category);
+  const toWorkspace = classifyAttachment(file) === "workspace";
   return (
     <div className="relative shrink-0">
       <div

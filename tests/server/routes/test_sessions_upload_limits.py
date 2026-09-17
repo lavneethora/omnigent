@@ -101,7 +101,7 @@ def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) 
 def test_upload_accepts_workspace_materialize_types(
     upload_client: tuple[TestClient, str], filename: str, mime: str
 ) -> None:
-    """Archives, office docs, and databases upload instead of 415ing — a
+    """Archives, office docs, and databases upload instead of 415ing, since a
     filesystem-capable harness reads them off disk rather than inlining them."""
     client, session_id = upload_client
     resp = client.post(

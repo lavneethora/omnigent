@@ -789,6 +789,7 @@ def _stored_file_to_resource(
             "filename": stored.filename,
             "bytes": stored.bytes,
             "created_at": stored.created_at,
+            "source_metadata": stored.source_metadata,
         },
     }
 
@@ -10609,9 +10610,9 @@ def _enforce_workspace_attachment_policy(
     Apply deployment policy to one workspace-materialized upload.
 
     Enforces the operator denylist and the per-session file-count and total-byte
-    quotas before the body is read, so a rejected upload never buffers. The
-    runner re-checks its own quotas when it writes the file; this is the
-    authoritative gate that can answer with a clear HTTP status.
+    quotas before the body is read, so a rejected upload never buffers. This
+    is the only quota gate: the runner can't enforce one, because a workspace
+    is shared by many sessions.
 
     :param filename: The upload's original filename, e.g. ``"bundle.zip"``.
     :param session_id: Owning session, whose existing attachments are counted.

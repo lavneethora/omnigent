@@ -48,7 +48,7 @@ _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
 
 # An unsupported type: ``addFiles`` rejects it (no chip) and shows an inline
-# error. Media is the remaining unsupported shape — office documents and
+# error. Media is the remaining unsupported shape; office documents and
 # archives are now workspace-delivered rather than rejected.
 _MEDIA_NAME = "clip.mp4"
 
@@ -204,7 +204,7 @@ def test_reject_unsupported_type(
 
     Covers the validation ``addFiles`` gained (``validateAttachments`` in
     lib/attachments.ts). Office documents and archives are no longer rejected
-    here — they are delivered to the workspace instead — so this pins the shape
+    here (they are delivered to the workspace instead), so this pins the shape
     that is still refused: media no harness can open from disk. Driving the
     hidden input directly (``set_input_files`` bypasses the accept filter, so
     the file reaches ``addFiles``) must yield NO chip and a visible error.

@@ -183,7 +183,7 @@ class PolicyEvent(TypedDict, total=False):
 
     - ``"request"``: ``data`` is ``{"user_content": <str>,
       "attachments": [{"filename", "content_type", "delivery", "text"},
-      ...]}`` — the user's typed message plus any uploaded attachments.
+      ...]}``: the user's typed message plus any uploaded attachments.
       ``delivery`` is ``"inline"`` for a file decoded into the model
       context (e.g. a CSV, whose ``text`` carries its content) or
       ``"workspace"`` for one written to the agent's filesystem instead

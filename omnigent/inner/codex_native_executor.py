@@ -51,10 +51,12 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import (
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
+    routed_attachment_reference_line,
     unresolved_attachment_marker,
-    workspace_attachment_reference_line,
     workspace_materialize_upload_limit,
 )
 from omnigent.util.reasoning_effort import (
@@ -747,6 +749,9 @@ def _content_to_input_items(
             if block is None:
                 continue
             block_type = block.get("type")
+            if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                _apply_resize_notice_to_latest_image(items, block.get("source_metadata"))
+                continue
             if block_type in {"input_text", "text"}:
                 text = block.get("text")
                 if isinstance(text, str) and text:
@@ -765,6 +770,18 @@ def _content_to_input_items(
     if content is None:
         return []
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+
+
+def _apply_resize_notice_to_latest_image(
+    items: list[dict[str, object]],
+    source_metadata: object,
+) -> None:
+    """Attach resize metadata to the preceding Codex image path."""
+    if items and items[-1].get("type") == "localImage":
+        item = items[-1]
+        path = item.get("path")
+        if isinstance(path, str):
+            item["path"] = str(codex_resize_metadata_path(Path(path), source_metadata))
 
 
 def _file_block_to_input_item(
@@ -797,11 +814,9 @@ def _file_block_to_input_item(
         workspace_materialize_upload_limit(filename if isinstance(filename, str) else None)
         is not None
     ):
-        if workspace is None:
-            return {"type": "text", "text": unresolved_attachment_marker(block)}
         return {
             "type": "text",
-            "text": workspace_attachment_reference_line(block, workspace),
+            "text": routed_attachment_reference_line(block, bridge_dir, workspace),
         }
     file_data = block.get("file_data")
     if isinstance(file_data, str) and file_data.startswith("data:"):
