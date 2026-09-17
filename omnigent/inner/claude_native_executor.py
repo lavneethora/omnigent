@@ -69,9 +69,6 @@ class ClaudeNativeExecutor(Executor):
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()
-        # Where non-inlinable attachments are materialized. Read once: the
-        # launch workspace does not change for the life of a bridge.
-        self._workspace = read_bridge_workspace(self._bridge_dir)
         # Serializes every write to the shared tmux pane. ``run_turn``
         # (the initiating message) and ``enqueue_session_message``
         # (mid-turn steering) run as concurrent tasks against this one
@@ -110,7 +107,7 @@ class ClaudeNativeExecutor(Executor):
         del session_key
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             return False
-        text = _content_to_text(content, self._bridge_dir, self._workspace)
+        text = _content_to_text(content, self._bridge_dir, read_bridge_workspace(self._bridge_dir))
         if not text:
             return False
         if is_auth_slash_command(text):
@@ -179,7 +176,9 @@ class ClaudeNativeExecutor(Executor):
                 )
             )
             return
-        text = _latest_user_text(messages, self._bridge_dir, self._workspace)
+        text = _latest_user_text(
+            messages, self._bridge_dir, read_bridge_workspace(self._bridge_dir)
+        )
         notices = _latest_framework_notices(messages)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")

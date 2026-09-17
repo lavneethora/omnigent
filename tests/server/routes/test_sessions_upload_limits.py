@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
+from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 from omnigent.inner.native_attachments import MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
 from omnigent.runtime.content_resolver import (
     MAX_TEXT_UPLOAD_BYTES,
@@ -38,6 +39,8 @@ def upload_client(db_uri: str, tmp_path) -> Iterator[tuple[TestClient, str]]:
     conv = conversation_store.create_conversation(
         title="upload session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
     )
+    # A Claude Code session, so workspace-delivered types are accepted.
+    conversation_store.set_labels(conv.id, CLAUDE_NATIVE_CODING_AGENT.presentation_labels)
 
     app = FastAPI()
 
@@ -110,6 +113,53 @@ def test_upload_accepts_workspace_materialize_types(
     )
     assert resp.status_code in (200, 201), resp.text
     assert resp.json()["name"] == filename
+
+
+def test_upload_rejects_workspace_types_for_a_harness_without_a_workspace(
+    upload_client: tuple[TestClient, str], db_uri: str
+) -> None:
+    """Only Claude Code and Codex open workspace files. Any other harness would
+    receive the zip inlined and drop it, so the upload is refused up front."""
+    client, _ = upload_client
+    sdk_session = SqlAlchemyConversationStore(db_uri).create_conversation(
+        title="sdk session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
+    resp = client.post(
+        f"/v1/sessions/{sdk_session.id}/resources/files",
+        files={"file": ("archive.zip", b"PK\x03\x04 fake zip", "application/zip")},
+    )
+    assert resp.status_code == 415, resp.text
+    assert "Claude Code or Codex" in resp.text
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {
+            "type": "input_file",
+            "filename": "payload.zip",
+            "file_data": "data:application/zip;base64,UEs=",
+        },
+        # A file_id alongside inline bytes would skip re-resolution, so it is refused too.
+        {
+            "type": "input_file",
+            "file_id": "file_abc",
+            "filename": "payload.zip",
+            "file_data": "data:application/zip;base64,UEs=",
+        },
+    ],
+)
+def test_message_cannot_inline_a_workspace_attachment(
+    upload_client: tuple[TestClient, str], block: dict[str, str]
+) -> None:
+    """Inline bytes would reach the workspace without the upload route's checks."""
+    client, session_id = upload_client
+    resp = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": [block]}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "payload.zip" in resp.text
 
 
 def test_upload_docx_mislabeled_as_zip_is_accepted(
@@ -324,6 +374,50 @@ def test_upload_rejects_once_the_session_file_quota_is_spent(
     assert "workspace attachments" in resp.text
 
 
+async def test_parallel_uploads_cannot_overspend_the_workspace_quota(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two uploads racing for the last free slot: exactly one is stored."""
+    import asyncio
+
+    import httpx
+
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.workspace_attachment_file_limit",
+        lambda: 1,
+    )
+    real_read = routes_resources._read_upload_capped
+
+    async def slow_read(file, limit):  # type: ignore[no-untyped-def]
+        # Widen the gap between the quota check and the store.
+        await asyncio.sleep(0.05)
+        return await real_read(file, limit)
+
+    monkeypatch.setattr(routes_resources, "_read_upload_capped", slow_read)
+    client, session_id = upload_client
+    transport = httpx.ASGITransport(app=client.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        responses = await asyncio.gather(
+            *(
+                http.post(
+                    f"/v1/sessions/{session_id}/resources/files",
+                    files={"file": (f"race{i}.zip", b"PK\x03\x04 fake zip", "application/zip")},
+                )
+                for i in range(2)
+            )
+        )
+
+    assert sorted(r.status_code for r in responses) == [201, 413]
+    stored = SqlAlchemyFileStore(db_uri).list(session_id=session_id, limit=10).data
+    assert [f.filename for f in stored if f.filename.endswith(".zip")] == [
+        next(r.json()["name"] for r in responses if r.status_code == 201)
+    ]
+
+
 def test_inlined_attachments_do_not_spend_the_workspace_quota(
     upload_client: tuple[TestClient, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -421,7 +515,7 @@ def test_quota_counts_workspace_files_past_any_page_boundary(
 
     with pytest.raises(HTTPException) as exc:
         _enforce_workspace_attachment_policy(
-            "two.zip",
+            ["two.zip"],
             session_id="conv_1",
             file_store=_OnePerPageStore(),  # type: ignore[arg-type]
         )

@@ -160,6 +160,9 @@ export function classifyAttachment(file: File): AttachmentCategory | null {
   const type = file.type || "";
   const ext = extensionOf(file.name || "");
 
+  // Checked first, like the server: delivery follows the extension, so a zip
+  // the browser reports as text/plain still goes to the workspace.
+  if (WORKSPACE_MATERIALIZE_EXTENSIONS.has(ext)) return "workspace";
   if (type.startsWith("image/")) return "image";
   if (type === "application/pdf" || ext === ".pdf") return "pdf";
   if (
@@ -169,9 +172,6 @@ export function classifyAttachment(file: File): AttachmentCategory | null {
   ) {
     return "text";
   }
-  // Checked after the text branch so a text/code extension keeps inline
-  // delivery even when its MIME says otherwise.
-  if (WORKSPACE_MATERIALIZE_EXTENSIONS.has(ext)) return "workspace";
   return null;
 }
 
@@ -196,7 +196,7 @@ export function validateAttachments(files: File[]): AttachmentValidation {
     const category = classifyAttachment(file);
     if (category === null) {
       errors.push(
-        `"${name}" can't be attached — only images, PDF, text/code, archives, ` +
+        `"${name}" can't be attached: only images, PDF, text/code, archives, ` +
           `office documents, and databases are supported.`,
       );
       continue;

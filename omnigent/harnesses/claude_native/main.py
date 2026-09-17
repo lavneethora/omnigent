@@ -5213,10 +5213,12 @@ async def _ensure_local_claude_resume_transcript(
             )
             return target
         raise
+    from omnigent.inner.native_attachments import resolve_session_item_file_references
+
     # Items are persisted with unresolved file_id attachment blocks;
     # fetch the bytes back so the rebuilt transcript can reference a
     # live local file instead of silently dropping the attachment.
-    items = await _resolve_session_item_file_references(client, session_id=session_id, items=items)
+    items = await resolve_session_item_file_references(client, session_id=session_id, items=items)
     records = _claude_transcript_records_from_session_items(
         items,
         session_id=session_id,
@@ -5380,60 +5382,6 @@ async def _fetch_all_session_items_for_claude_resume(
                 f"History fetch for {session_id!r} set has_more without last_id."
             )
         after = last_id
-
-
-async def _resolve_session_item_file_references(
-    client: httpx.AsyncClient,
-    *,
-    session_id: str,
-    items: list[_JsonObject],
-) -> list[_JsonObject]:
-    """
-    Inline ``file_id`` attachment blocks as base64 data URIs.
-
-    Message items come back from the server in pre-resolution form (the
-    upload's raw ``file_id``). The transcript rebuild runs where no
-    file/artifact stores exist, so bytes are fetched back through the
-    session-scoped file resource endpoints — the same fetch the runner's
-    current-message fallback performs. A failed fetch is non-fatal: the
-    block stays unresolved and the converter surfaces a visible marker.
-
-    :param client: HTTP client pointed at the Omnigent server.
-    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :param items: Flat API item dicts from ``GET /v1/sessions/{id}/items``.
-    :returns: The same items with resolvable attachment blocks rewritten
-        to carry ``image_url`` / ``file_data`` data URIs.
-    """
-    from omnigent.inner.native_attachments import (
-        framework_notice_block,
-        has_unresolved_file_id,
-        resolve_file_id_block,
-    )
-
-    for item in items:
-        content = item.get("content")
-        if item.get("type") != "message" or not isinstance(content, list):
-            continue
-        resolved_content: list[object] = []
-        for block in content:
-            parsed_block = _json_object(block)
-            if parsed_block is not None and has_unresolved_file_id(parsed_block):
-                result = await resolve_file_id_block(
-                    parsed_block,
-                    session_id=session_id,
-                    client=client,
-                )
-                if result is None:
-                    resolved_content.append(parsed_block)
-                else:
-                    new_block, notice = result
-                    resolved_content.append(new_block)
-                    if notice is not None:
-                        resolved_content.append(framework_notice_block(notice))
-            else:
-                resolved_content.append(block)
-        item["content"] = resolved_content
-    return items
 
 
 def _claude_transcript_records_from_session_items(

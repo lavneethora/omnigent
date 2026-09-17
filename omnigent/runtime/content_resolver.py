@@ -792,6 +792,7 @@ def _resolve_message_content(
     cache: dict[str, str] | None = None,
     *,
     session_id: str | None = None,
+    defer_workspace_files: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Resolve ``file_id`` references in a list of content blocks.
@@ -807,6 +808,8 @@ def _resolve_message_content(
         :func:`resolve_content_references`).
     :param session_id: Optional owning session id used to verify
         session-scoped file ownership, e.g. ``"conv_abc123"``.
+    :param defer_workspace_files: Leave workspace-materialize files as
+        ``file_id`` references for a native runner to fetch, instead of raising.
     :returns: The original list (unchanged) or a new list with
         ``file_id`` references resolved to inline content.
     """
@@ -820,6 +823,7 @@ def _resolve_message_content(
                 artifact_store,
                 cache,
                 session_id=session_id,
+                defer_workspace_files=defer_workspace_files,
             )
             resolved.append(resolved_block)
             if notice is not None:
@@ -854,6 +858,7 @@ def _resolve_file_id_block(
     cache: dict[str, str] | None = None,
     *,
     session_id: str | None = None,
+    defer_workspace_files: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int] | None]:
     """
     Resolve a single content block's ``file_id`` to inline content.
@@ -874,13 +879,16 @@ def _resolve_file_id_block(
         :func:`resolve_content_references`).
     :param session_id: Optional owning session id used to verify
         session-scoped file ownership, e.g. ``"conv_abc123"``.
+    :param defer_workspace_files: Return a workspace-materialize block
+        unchanged, ``file_id`` kept, for a native runner to fetch.
     :returns: ``(block, notice)`` — a new dict with ``file_id`` replaced by
         inline content (all other fields preserved), and an optional resize
         source dimensions to emit alongside a downscaled image (``None`` otherwise).
     :raises ValueError: If ``file_id`` is not found in the file
         store — the file was deleted between request validation
         and agent loop execution. Also raised when the referenced file is a
-        workspace-materialize type this (non-native) adapter can't inline.
+        workspace-materialize type this (non-native) adapter can't inline,
+        unless *defer_workspace_files* is set.
     """
     file_id = block["file_id"]
     owner_session_id = session_id or _session_id_from_block(block)
@@ -898,6 +906,8 @@ def _resolve_file_id_block(
     from omnigent.inner.native_attachments import workspace_materialize_upload_limit
 
     if workspace_materialize_upload_limit(file_meta.filename) is not None:
+        if defer_workspace_files:
+            return dict(block), None
         raise ValueError(
             f"Attachment '{file_meta.filename}' requires a filesystem-capable "
             "harness (e.g. Claude Code, Codex) and cannot be used with this model."

@@ -108,6 +108,10 @@ _WORKSPACE_MATERIALIZE_EXTENSIONS: frozenset[str] = frozenset(
     {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}
 )
 
+# Harnesses whose executors materialize workspace attachments. Any other harness
+# would receive the file inlined and drop it, so the upload is refused instead.
+WORKSPACE_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "codex-native"})
+
 
 def workspace_materialize_upload_limit(filename: str | None) -> int | None:
     """
@@ -128,6 +132,30 @@ def workspace_materialize_upload_limit(filename: str | None) -> int | None:
     if PurePath(filename).suffix.lower() not in _WORKSPACE_MATERIALIZE_EXTENSIONS:
         return None
     return MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
+
+
+def inline_workspace_attachment_name(content: object) -> str | None:
+    """
+    Filename of the first workspace-type attachment that carries inline bytes.
+
+    Workspace files must arrive as uploaded ``file_id`` references, so the
+    upload route's harness, denylist, and quota checks run before any bytes
+    reach the sandbox.
+
+    :param content: A message's content blocks.
+    :returns: The offending filename, e.g. ``"payload.zip"``, or ``None``.
+    """
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        filename = block.get("filename")
+        if not isinstance(filename, str) or workspace_materialize_upload_limit(filename) is None:
+            continue
+        if block.get("file_data") or block.get("image_url"):
+            return filename
+    return None
 
 
 def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Path | None:
@@ -678,3 +706,44 @@ async def resolve_file_id_block(
     else:
         new_block["file_data"] = f"data:{content_type};base64,{encoded}"
     return new_block, notice
+
+
+async def resolve_session_item_file_references(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Inline ``file_id`` attachment blocks in rebuilt history as base64 data URIs.
+
+    Message items come back from the server with the upload's raw ``file_id``.
+    A cold-resume rebuild runs where no file/artifact stores exist, so bytes are
+    fetched back through the session file endpoints, as for a live turn. A failed
+    fetch is non-fatal: the block stays unresolved and surfaces a visible marker.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param items: Flat API item dicts from ``GET /v1/sessions/{id}/items``.
+    :returns: The same items with resolvable attachment blocks rewritten
+        to carry ``image_url`` / ``file_data`` data URIs.
+    """
+    for item in items:
+        content = item.get("content")
+        if item.get("type") != "message" or not isinstance(content, list):
+            continue
+        resolved_content: list[object] = []
+        for block in content:
+            if not (isinstance(block, dict) and has_unresolved_file_id(block)):
+                resolved_content.append(block)
+                continue
+            result = await resolve_file_id_block(block, session_id=session_id, client=client)
+            if result is None:
+                resolved_content.append(block)
+                continue
+            new_block, notice = result
+            resolved_content.append(new_block)
+            if notice is not None:
+                resolved_content.append(framework_notice_block(notice))
+        item["content"] = resolved_content
+    return items

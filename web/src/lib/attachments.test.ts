@@ -55,6 +55,8 @@ describe("classifyAttachment", () => {
       "workspace",
     );
     expect(classifyAttachment(makeFile("app.sqlite3", ""))).toBe("workspace");
+    // The extension wins over a text MIME, matching the server.
+    expect(classifyAttachment(makeFile("a.zip", "text/plain"))).toBe("workspace");
   });
 
   it("still rejects types no harness can open from disk", () => {

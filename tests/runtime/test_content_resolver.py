@@ -697,6 +697,44 @@ def test_workspace_materialize_file_rejected_by_generic_resolver() -> None:
         )
 
 
+def test_native_forward_defers_workspace_files_and_resolves_the_rest() -> None:
+    """The native runner fetches workspace files itself, so forwarding leaves
+    them as file_id references rather than failing the whole message."""
+    from omnigent.runtime.content_resolver import _resolve_message_content
+
+    store = FakeFileStore(
+        files={
+            "file_zip": StoredFile(
+                id="file_zip",
+                created_at=1000,
+                filename="archive.zip",
+                bytes=4,
+                content_type="application/zip",
+            ),
+            "file_txt": StoredFile(
+                id="file_txt",
+                created_at=1000,
+                filename="notes.txt",
+                bytes=5,
+                content_type="text/plain",
+            ),
+        }
+    )
+    zip_block = {"type": "input_file", "file_id": "file_zip", "filename": "archive.zip"}
+    content = [zip_block, {"type": "input_file", "file_id": "file_txt", "filename": "notes.txt"}]
+
+    resolved = _resolve_message_content(
+        content,
+        store,
+        FakeArtifactStore(blobs={"file_txt": b"hello"}),  # type: ignore[arg-type]
+        defer_workspace_files=True,
+    )
+
+    assert resolved[0] == zip_block
+    assert resolved[1]["file_data"].startswith("data:text/plain;base64,")
+    assert "file_id" not in resolved[1]
+
+
 # ── _resolve_content_type tests ───────────────────────────────────────
 
 
