@@ -678,21 +678,22 @@ def extract_text_attachments(
         ):
             continue
         content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
+        # Checked before the text-like test: delivery follows the filename, so
+        # an archive stored under a text MIME still reaches the filesystem and
+        # must be announced as such rather than decoded as inline text.
+        if workspace_materialize_upload_limit(file_meta.filename) is not None:
+            # No scannable text, but announce it by name so a policy can still
+            # refuse it on its filename or extension.
+            attachments.append(
+                {
+                    "filename": file_meta.filename or "",
+                    "content_type": content_type,
+                    "delivery": "workspace",
+                    "text": "",
+                }
+            )
+            continue
         if not _is_text_like_attachment(content_type, file_meta.filename):
-            # Workspace-delivered files (archives, office documents, databases)
-            # hold no scannable text, but they do reach the agent's filesystem.
-            # Announce them by name so a policy can still refuse one on its
-            # filename or extension; skipping them entirely would make the
-            # request look like it carried no attachment at all.
-            if workspace_materialize_upload_limit(file_meta.filename) is not None:
-                attachments.append(
-                    {
-                        "filename": file_meta.filename or "",
-                        "content_type": content_type,
-                        "delivery": "workspace",
-                        "text": "",
-                    }
-                )
             continue
         try:
             raw = artifact_store.get(file_id)
@@ -901,6 +902,10 @@ def _resolve_file_id_block(
 
     # Copy all fields except file_id.
     resolved: dict[str, Any] = {k: v for k, v in block.items() if k != "file_id"}
+    if file_meta.filename:
+        # The stored name decides delivery; the block's own filename is
+        # client-supplied and must not be able to relabel the file.
+        resolved["filename"] = file_meta.filename
 
     content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
 

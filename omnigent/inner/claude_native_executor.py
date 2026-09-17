@@ -7,7 +7,7 @@ import contextlib
 import logging
 import os
 import threading
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
 
@@ -39,12 +39,7 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.inner.native_attachments import (
-    attachment_reference_line,
-    unresolved_attachment_marker,
-    workspace_attachment_reference_line,
-    workspace_materialize_upload_limit,
-)
+from omnigent.inner.native_attachments import routed_attachment_reference_line
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
@@ -490,25 +485,9 @@ def _content_to_text(
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                attachment_lines.append(_attachment_line(block, bridge_dir, workspace))
+                attachment_lines.append(
+                    routed_attachment_reference_line(block, bridge_dir, workspace)
+                )
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""
-
-
-def _attachment_line(block: Mapping[str, object], bridge_dir: Path, workspace: Path | None) -> str:
-    """
-    Reference line for one attachment, routed by delivery mode.
-
-    :param block: Attachment content block.
-    :param bridge_dir: Bridge directory for inlinable types.
-    :param workspace: Workspace root for materialized types, or ``None``.
-    :returns: The transcript line referencing the materialized file, or a
-        visible marker when it could not be placed.
-    """
-    filename = block.get("filename")
-    if workspace_materialize_upload_limit(filename if isinstance(filename, str) else None) is None:
-        return attachment_reference_line(block, bridge_dir)
-    if workspace is None:
-        return unresolved_attachment_marker(block)
-    return workspace_attachment_reference_line(block, workspace)

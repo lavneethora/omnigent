@@ -3403,6 +3403,39 @@ async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
     assert "file_id" not in written.read_text(encoding="utf-8")
 
 
+def test_resume_rebuild_delivers_a_zip_to_the_launch_workspace(tmp_path: Path) -> None:
+    """
+    A zip in resumed history lands in the workspace, as on a live turn.
+
+    After runner replacement the transcript is rebuilt from stored items. The
+    bridge dir sits outside the tree Claude's tools can reach, so routing the
+    archive there would leave the resumed session unable to open it.
+    """
+    from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
+    from omnigent.inner.native_attachments import WORKSPACE_ATTACHMENTS_DIRNAME
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (bridge_dir / _CONFIG_FILE).write_text(json.dumps({"workspace": str(workspace)}))
+    zip_bytes = b"PK\x03\x04 resumed zip"
+    content = [
+        {
+            "type": "input_file",
+            "filename": "bundle.zip",
+            "file_data": "data:application/zip;base64," + base64.b64encode(zip_bytes).decode(),
+        }
+    ]
+
+    blocks = claude_native._claude_attachment_text_blocks_from_api_content(content, bridge_dir)
+
+    expected = workspace / WORKSPACE_ATTACHMENTS_DIRNAME / "bundle.zip"
+    assert blocks == [{"type": "text", "text": f"[Attached file: {expected}]"}]
+    assert expected.read_bytes() == zip_bytes
+    assert not (bridge_dir / "uploads").exists()
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_claude_resume_transcript_marks_unresolvable_attachment(
     tmp_path: Path,

@@ -351,3 +351,79 @@ def test_inlined_attachments_do_not_spend_the_workspace_quota(
     )
 
     assert resp.status_code in (200, 201), resp.text
+
+
+def test_declared_text_mime_cannot_skip_the_workspace_policy(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A zip sent as ``text/plain`` still goes through the workspace checks.
+
+    Delivery follows the filename, so trusting the declared MIME would store
+    the archive as inline text, skip the denylist and quota, and still have
+    the executor write it into the workspace.
+    """
+    monkeypatch.setattr(
+        "omnigent.server.server_config.workspace_attachment_denied_extensions",
+        lambda: frozenset({".zip"}),
+    )
+    client, session_id = upload_client
+
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"PK\x03\x04 fake zip", "text/plain")},
+    )
+
+    assert resp.status_code == 415, resp.text
+    assert "not accepted by this deployment" in resp.text
+
+
+def test_quota_counts_workspace_files_past_any_page_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Workspace files are counted however many inline files precede them.
+
+    Stopping after a fixed number of pages let a session bury workspace
+    uploads behind enough inline ones and exceed its configured limit. The
+    fake store serves one record per page so the zip sits past the point where
+    the old 20-page scan stopped.
+    """
+    from fastapi import HTTPException
+
+    from omnigent.entities import StoredFile
+    from omnigent.entities.pagination import PagedList
+    from omnigent.server.routes._sessions.helpers import _enforce_workspace_attachment_policy
+
+    records = [
+        StoredFile(id=f"f{i:03d}", created_at=i, filename=f"n{i}.txt", bytes=2) for i in range(30)
+    ] + [StoredFile(id="f999", created_at=999, filename="one.zip", bytes=4)]
+
+    class _OnePerPageStore:
+        """Serves the session's files one record per page, oldest first."""
+
+        def list(self, session_id: str, limit: int, after: str | None, order: str):
+            del session_id, limit, order
+            index = 0 if after is None else [r.id for r in records].index(after) + 1
+            page = records[index : index + 1]
+            return PagedList(
+                data=page,
+                first_id=page[0].id if page else None,
+                last_id=page[-1].id if page else None,
+                has_more=index + 1 < len(records),
+            )
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.workspace_attachment_file_limit",
+        lambda: 1,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        _enforce_workspace_attachment_policy(
+            "two.zip",
+            session_id="conv_1",
+            file_store=_OnePerPageStore(),  # type: ignore[arg-type]
+        )
+
+    assert exc.value.status_code == 413

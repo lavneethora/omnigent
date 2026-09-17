@@ -15,14 +15,19 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
+import errno
 import hashlib
 import logging
+import os
 import re
+import stat
 import urllib.parse
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePath
+from typing import Literal
 
 import httpx
 
@@ -82,11 +87,11 @@ def parse_data_uri(uri: str) -> DataUri:
 # Subdirectory of the harness workspace that user-attached files land in.
 WORKSPACE_ATTACHMENTS_DIRNAME = "session-attachments"
 
-# Per-file upload cap and per-session disk quotas for workspace-materialized
-# attachments. These bound sandbox disk usage rather than a base64 request
-# payload — nothing here is ever inlined — so they sit well above the inline
-# caps in omnigent/runtime/content_resolver.py. Conservative and not yet
-# deployment-configurable; widen alongside a denylist-config follow-up.
+# Default per-file cap and per-session quotas for workspace-materialized
+# attachments. They bound sandbox disk usage rather than a base64 request
+# payload, so they sit well above the inline caps. The server enforces them per
+# session at upload (see omnigent/server/server_config.py for the overrides);
+# the runner cannot, because one workspace is shared by many sessions.
 MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
 MAX_SESSION_WORKSPACE_ATTACHMENTS: int = 20
 MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES: int = 200 * 1024 * 1024
@@ -194,28 +199,6 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
     return raw_bytes, _MARKER_UNSAFE.sub("_", filename)
 
 
-def workspace_attachment_usage(workspace: Path) -> tuple[int, int]:
-    """
-    Count and total size of files already materialized into *workspace*.
-
-    :param workspace: Harness workspace root, e.g. ``Path("/home/me/repo")``.
-    :returns: ``(file_count, total_bytes)`` for the session-attachments
-        directory. Best-effort: an unreadable or absent directory counts as
-        empty, since a stat failure must not fail the turn.
-    """
-    count = 0
-    total = 0
-    try:
-        for entry in (workspace / WORKSPACE_ATTACHMENTS_DIRNAME).iterdir():
-            if entry.is_symlink() or not entry.is_file():
-                continue
-            count += 1
-            total += entry.stat().st_size
-    except OSError:
-        pass
-    return count, total
-
-
 def materialize_attachment_to_workspace(
     block: Mapping[str, object], workspace: Path
 ) -> Path | None:
@@ -229,66 +212,144 @@ def materialize_attachment_to_workspace(
     extracted, and the execute bits are always cleared so a materialized
     file can't be run.
 
+    The workspace may hold files someone else prepared, so every open is
+    relative to a no-follow handle on the attachments directory and new files
+    are created exclusively. A symlink planted at the destination, or at the
+    collision name, fails the open instead of redirecting the write.
+
     :param block: Attachment content block (see
         :func:`materialize_attachment`).
     :param workspace: Harness workspace root, e.g. ``Path("/home/me/repo")``.
-    :returns: Path to the written file, or ``None`` when the block could not
-        be materialized — undecodable, quota exceeded, or a destination that
-        escapes the attachments directory.
+    :returns: Path to the materialized file, or ``None`` when the block could
+        not be materialized: undecodable, a symlink in the way, or both the
+        original and collision names already holding other content.
     """
     decoded = _decode_attachment_block(block)
     if decoded is None:
         return None
     raw_bytes, filename = decoded
+    if filename in (".", "..") or os.sep in filename:
+        return None
 
     attachments_dir = workspace.resolve() / WORKSPACE_ATTACHMENTS_DIRNAME
-    if attachments_dir.is_symlink():
-        # A symlinked attachments dir would redirect writes out of the
-        # workspace, so refuse rather than following it.
-        _logger.warning("Refusing to materialize into symlinked %s", attachments_dir)
-        return None
-
-    dest = attachments_dir / filename
-    try:
-        dest.resolve().relative_to(attachments_dir)
-    except ValueError:
-        _logger.warning("Refusing attachment path outside %s", attachments_dir)
-        return None
-    if dest.is_symlink():
-        _logger.warning("Refusing to write through symlink %s", dest)
-        return None
-
-    if dest.exists() and not _holds_bytes(dest, raw_bytes):
-        # Same name, different bytes — suffix by content so one file exists
-        # per payload rather than a copy per rebuild.
-        digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
-        dest = dest.with_stem(f"{dest.stem}_{digest}")
-    if _holds_bytes(dest, raw_bytes):
-        # Already materialized (e.g. a re-resolved block after a runner
-        # relaunch); reuse it so the rewrite doesn't count against quota.
-        return dest
-
-    count, total = workspace_attachment_usage(workspace)
-    if (
-        count + 1 > MAX_SESSION_WORKSPACE_ATTACHMENTS
-        or total + len(raw_bytes) > MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES
-    ):
-        _logger.warning(
-            "Session attachment quota exceeded (%d files, %d bytes); skipping %s",
-            count,
-            total,
-            filename,
-        )
-        return None
-
     try:
         attachments_dir.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(raw_bytes)
-        dest.chmod(dest.stat().st_mode & ~0o111)
+        # O_NOFOLLOW refuses a symlinked attachments directory outright.
+        dir_fd = os.open(attachments_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
-        _logger.warning("Failed to materialize attachment to %s", dest, exc_info=True)
+        _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
         return None
-    return dest
+    try:
+        stem, suffix = os.path.splitext(filename)
+        digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+        for name in (filename, f"{stem}_{digest}{suffix}"):
+            outcome = _place_no_follow(dir_fd, name, raw_bytes)
+            if outcome == "symlink":
+                _logger.warning("Refusing to write through symlink %s", attachments_dir / name)
+                return None
+            if outcome == "placed":
+                return attachments_dir / name
+        _logger.warning("Attachment names for %s already hold other content", filename)
+        return None
+    except OSError:
+        _logger.warning("Failed to materialize attachment %s", filename, exc_info=True)
+        return None
+    finally:
+        os.close(dir_fd)
+
+
+def _place_no_follow(
+    dir_fd: int, name: str, raw_bytes: bytes
+) -> Literal["placed", "taken", "symlink"]:
+    """
+    Reuse or create *name* under *dir_fd* without following symlinks.
+
+    :param dir_fd: No-follow descriptor for the attachments directory.
+    :param name: Base filename, no directory components.
+    :param raw_bytes: Decoded attachment payload.
+    :returns: ``"placed"`` when the name now holds *raw_bytes* (freshly
+        created, or an identical regular file reused with its execute bits
+        cleared); ``"taken"`` when it holds other content or is not a regular
+        file; ``"symlink"`` when it is a symlink.
+    :raises OSError: When writing a new file fails part-way.
+    """
+    try:
+        # O_NONBLOCK keeps a FIFO planted at the name from hanging the open.
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return _create_no_follow(dir_fd, name, raw_bytes)
+    except OSError as exc:
+        return "symlink" if exc.errno == errno.ELOOP else "taken"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != len(raw_bytes):
+            return "taken"
+        if _read_fd(fd, info.st_size) != raw_bytes:
+            return "taken"
+        try:
+            os.fchmod(fd, stat.S_IMODE(info.st_mode) & ~0o111)
+        except OSError:
+            # A reused file must not stay executable; if the bits can't be
+            # cleared, fall through to the collision name instead.
+            return "taken"
+        return "placed"
+    finally:
+        os.close(fd)
+
+
+def _create_no_follow(
+    dir_fd: int, name: str, raw_bytes: bytes
+) -> Literal["placed", "taken", "symlink"]:
+    """
+    Create *name* exclusively under *dir_fd* and write *raw_bytes* to it.
+
+    :param dir_fd: No-follow descriptor for the attachments directory.
+    :param name: Base filename, no directory components.
+    :param raw_bytes: Decoded attachment payload.
+    :returns: ``"placed"`` on success; ``"taken"`` when something appeared at
+        the name first; ``"symlink"`` when that something is a symlink.
+    :raises OSError: When the write fails; the partial file is removed.
+    """
+    try:
+        # Mode 0o644 carries no execute bits, and O_EXCL never follows or
+        # reuses an existing entry, a dangling symlink included.
+        fd = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd
+        )
+    except FileExistsError:
+        return "taken"
+    except OSError as exc:
+        return "symlink" if exc.errno == errno.ELOOP else "taken"
+    try:
+        view = memoryview(raw_bytes)
+        while view:
+            view = view[os.write(fd, view) :]
+    except OSError:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=dir_fd)
+        raise
+    os.close(fd)
+    return "placed"
+
+
+def _read_fd(fd: int, size: int) -> bytes:
+    """
+    Read exactly *size* bytes from *fd*, stopping early at end of file.
+
+    :param fd: Open file descriptor positioned at the start.
+    :param size: Number of bytes to read.
+    :returns: The bytes read.
+    """
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 1024 * 1024))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _holds_bytes(path: Path, raw_bytes: bytes) -> bool:
@@ -380,6 +441,30 @@ def workspace_attachment_reference_line(block: Mapping[str, object], workspace: 
     return unresolved_attachment_marker(block)
 
 
+def routed_attachment_reference_line(
+    block: Mapping[str, object], bridge_dir: Path, workspace: Path | None
+) -> str:
+    """
+    Reference line for one attachment, routed by its delivery mode.
+
+    Shared by live turns and transcript rebuilds so both deliver an attachment
+    the same way.
+
+    :param block: Attachment content block.
+    :param bridge_dir: Bridge directory for inlinable types.
+    :param workspace: Workspace root for materialized types, or ``None`` when
+        the launch recorded none.
+    :returns: The line referencing the materialized file, or a visible marker
+        when it could not be placed.
+    """
+    filename = block.get("filename")
+    if workspace_materialize_upload_limit(filename if isinstance(filename, str) else None) is None:
+        return attachment_reference_line(block, bridge_dir)
+    if workspace is None:
+        return unresolved_attachment_marker(block)
+    return workspace_attachment_reference_line(block, workspace)
+
+
 def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
     """
     True if *block* carries a ``file_id`` no resolver has inlined yet.
@@ -457,6 +542,11 @@ async def resolve_file_id_block(
     content_type = content_type.split(";", 1)[0]
     encoded = base64.b64encode(content_resp.content).decode("ascii")
     new_block = {k: v for k, v in block.items() if k != "file_id"}
+    stored_name = meta.get("name")
+    if isinstance(stored_name, str) and stored_name:
+        # The stored name decides delivery. The block's own filename comes from
+        # the client and could steer an upload past the workspace checks.
+        new_block["filename"] = stored_name
     if block.get("type") == "input_image":
         new_block["image_url"] = f"data:{content_type};base64,{encoded}"
     else:

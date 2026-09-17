@@ -1590,26 +1590,32 @@ def register_resources_routes(
             file.content_type,
             file.filename,
         )
-        type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
-            # The browser/OS can mislabel a text/code file as binary (e.g. a
-            # .csv reported as application/vnd.ms-excel on Windows). Fall back
-            # to the extension — matching the web client's allowlist — and
-            # normalize the type so the resolver inlines it as text.
-            ext_type = attachment_text_type_for_extension(file.filename)
-            if ext_type is not None:
-                content_type = ext_type
-                type_limit = attachment_upload_limit(content_type)
-        upload_cap = None if type_limit is None else min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
-        to_workspace = False
-        if upload_cap is None:
-            # Office documents, archives, and databases aren't inlinable, but a
-            # filesystem-capable harness reads them off disk (see
-            # native_attachments.materialize_attachment_to_workspace). Store
-            # them under their own cap; the global ceiling only backstops
-            # base64 request inflation, which this path never incurs.
-            upload_cap = workspace_materialize_upload_limit(file.filename)
-            to_workspace = upload_cap is not None
+        # Office documents, archives, and databases aren't inlinable, but a
+        # filesystem-capable harness reads them off disk (see
+        # native_attachments.materialize_attachment_to_workspace). Delivery
+        # follows the filename, so decide it before the declared MIME: a zip
+        # sent as text/plain must not slip onto the inline path and skip the
+        # workspace policy. The global ceiling only backstops base64 request
+        # inflation, which this path never incurs.
+        upload_cap = workspace_materialize_upload_limit(file.filename)
+        to_workspace = upload_cap is not None
+        if to_workspace:
+            # Drop the declared type so the file is never stored as text.
+            content_type = _resolve_content_type("application/octet-stream", file.filename)
+        else:
+            type_limit = attachment_upload_limit(content_type)
+            if type_limit is None:
+                # The browser/OS can mislabel a text/code file as binary (e.g. a
+                # .csv reported as application/vnd.ms-excel on Windows). Fall back
+                # to the extension — matching the web client's allowlist — and
+                # normalize the type so the resolver inlines it as text.
+                ext_type = attachment_text_type_for_extension(file.filename)
+                if ext_type is not None:
+                    content_type = ext_type
+                    type_limit = attachment_upload_limit(content_type)
+            upload_cap = (
+                None if type_limit is None else min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+            )
         if upload_cap is None:
             raise HTTPException(
                 status_code=415,

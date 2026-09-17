@@ -5811,27 +5811,31 @@ def _claude_attachment_text_blocks_from_api_content(
     """
     Re-materialize attachment blocks as transcript text references.
 
-    Mirrors the native executors' turn-time behavior: a resolved data-URI
-    block is decoded to ``<bridge_dir>/uploads/`` and referenced with the
-    ``[Attached: <path>]`` marker so Claude can Read it after a resume; a
-    block whose bytes never arrived yields the could-not-load placeholder
-    instead of vanishing from the rebuilt transcript.
+    Routes each block exactly as a live turn does, so a resume after runner
+    replacement reaches the same file: inlinable types are decoded to
+    ``<bridge_dir>/uploads/``, archives and other workspace-delivered types to
+    the launch workspace recorded in the bridge config. A block whose bytes
+    never arrived yields the could-not-load placeholder instead of vanishing
+    from the rebuilt transcript.
 
     :param content: Omnigent content array, e.g.
         ``[{"type": "input_image", "image_url": "data:image/png;..."}]``.
     :param bridge_dir: Session bridge directory to write files under.
     :returns: Claude ``{"type": "text", "text": ...}`` blocks.
     """
-    from omnigent.inner.native_attachments import attachment_reference_line
+    from omnigent.harnesses.claude_native.bridge import read_bridge_workspace
+    from omnigent.inner.native_attachments import routed_attachment_reference_line
 
     if not isinstance(content, list):
         return []
+    workspace = read_bridge_workspace(bridge_dir)
     blocks: list[_JsonObject] = []
     for value in content:
         block = _json_object(value)
         if block is None or block.get("type") not in ("input_image", "input_file"):
             continue
-        blocks.append({"type": "text", "text": attachment_reference_line(block, bridge_dir)})
+        line = routed_attachment_reference_line(block, bridge_dir, workspace)
+        blocks.append({"type": "text", "text": line})
     return blocks
 
 

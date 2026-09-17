@@ -10595,11 +10595,7 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-# Pages of a session's files scanned when totalling its workspace-materialized
-# attachments. Bounds the walk so a session with a very large file list cannot
-# turn one upload into an unbounded number of store reads; the per-session file
-# quota is far below this in every supported configuration.
-_WORKSPACE_QUOTA_SCAN_PAGES = 20
+# Page size for walking a session's files when totalling its workspace attachments.
 _WORKSPACE_QUOTA_PAGE_SIZE = 100
 
 
@@ -10645,7 +10641,10 @@ def _enforce_workspace_attachment_policy(
     used_files = 0
     used_bytes = 0
     after: str | None = None
-    for _ in range(_WORKSPACE_QUOTA_SCAN_PAGES):
+    # Walk every page: stopping at a fixed page count would let a session hide
+    # workspace files behind enough inline ones. The walk ends early once the
+    # quota is already exhausted, since the answer can't change after that.
+    while used_files + 1 <= max_files and used_bytes < max_total_bytes:
         page = file_store.list(
             session_id=session_id,
             limit=_WORKSPACE_QUOTA_PAGE_SIZE,

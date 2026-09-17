@@ -1635,6 +1635,42 @@ def test_inlined_attachment_is_marked_as_inline_delivery() -> None:
     assert out[0]["delivery"] == "inline"
 
 
+def test_archive_stored_under_a_text_mime_is_announced_as_workspace() -> None:
+    """
+    An archive stored as ``text/plain`` is still announced as workspace delivery.
+
+    Delivery follows the filename, so the file reaches the agent's filesystem
+    either way. Classifying it by MIME would decode the archive as inline text
+    and hide from policy that a binary was written to disk.
+    """
+    fs, arts = _stores_with("file_zip", "bundle.zip", "text/plain", b"PK\x03\x04data")
+    content = [{"type": "input_file", "file_id": "file_zip"}]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert len(out) == 1
+    assert out[0]["delivery"] == "workspace"
+    assert out[0]["text"] == ""
+
+
+def test_resolved_block_takes_its_filename_from_the_stored_file() -> None:
+    """
+    A message cannot relabel an upload by naming it differently.
+
+    The stored name decides delivery; a client-supplied ``payload.db`` on a
+    block pointing at ``payload.txt`` must not route the file to the workspace.
+    """
+    fs, arts = _stores_with("file_txt", "payload.txt", "text/plain", b"hello")
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_txt", "filename": "payload.db"}]
+    )
+
+    result = resolve_content_references([item], fs, arts)  # type: ignore[arg-type]
+
+    assert isinstance(result[0].data, MessageData)
+    assert result[0].data.content[0]["filename"] == "payload.txt"
+
+
 def test_skips_binary_attachments() -> None:
     """Non-text attachments (image/PDF) are not decoded."""
     fs, arts = _stores_with("file_png", "photo.png", "image/png", PNG_BYTES)
