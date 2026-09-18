@@ -18,6 +18,10 @@
  * before storing it, so screenshots and retina captures no longer need to be
  * shrunk by hand. Other image types (SVG, …) can't be shrunk, so they keep the
  * smaller `UNCOMPRESSED_IMAGE_LIMIT_MB` cap (see `validateAttachments`).
+ *
+ * These are fixed client-side ceilings, so a deployment that raises a server
+ * limit (e.g. `workspace_attachment_max_bytes`) also needs these raised for the
+ * extra allowance to be usable from the web UI.
  */
 export const ATTACHMENT_SIZE_LIMITS_MB = {
   image: 50,

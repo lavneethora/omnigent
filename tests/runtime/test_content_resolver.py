@@ -1800,6 +1800,32 @@ def test_archive_stored_under_a_text_mime_is_announced_as_workspace() -> None:
     assert out[0]["text"] == ""
 
 
+def test_workspace_attachment_sent_as_an_image_is_still_announced() -> None:
+    """
+    A workspace file a client sent as an image block is announced too.
+
+    An archive uploaded under an image MIME comes back as an ``input_image``
+    block, and delivery follows the stored filename, so it reaches the
+    filesystem. Scanning only ``input_file`` blocks would hide it from policy.
+    """
+    fs, arts = _stores_with("file_zip", "bundle.zip", "image/png", b"PK\x03\x04data")
+    content = [{"type": "input_image", "file_id": "file_zip"}]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert len(out) == 1
+    assert out[0]["filename"] == "bundle.zip"
+    assert out[0]["delivery"] == "workspace"
+
+
+def test_an_image_attachment_is_not_announced_to_policy() -> None:
+    """Images carry no scannable text and never reach the filesystem."""
+    fs, arts = _stores_with("file_png", "shot.png", "image/png", b"\x89PNG data")
+    content = [{"type": "input_image", "file_id": "file_png"}]
+
+    assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
+
+
 def test_resolved_block_takes_its_filename_from_the_stored_file() -> None:
     """
     A message cannot relabel an upload by naming it differently.

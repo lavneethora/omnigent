@@ -756,6 +756,16 @@ def _content_to_input_items(
                 text = block.get("text")
                 if isinstance(text, str) and text:
                     items.append({"type": "text", "text": text})
+            elif _is_workspace_attachment(block):
+                # Delivery follows the stored filename, whichever block type the
+                # client chose: a zip declared image/png is still a workspace file,
+                # never a localImage codex would fail to open.
+                items.append(
+                    {
+                        "type": "text",
+                        "text": routed_attachment_reference_line(block, bridge_dir, workspace),
+                    }
+                )
             elif block_type == "input_image":
                 path = materialize_attachment(block, bridge_dir)
                 if path is not None:
@@ -770,6 +780,15 @@ def _content_to_input_items(
     if content is None:
         return []
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+
+
+def _is_workspace_attachment(block: Mapping[str, object]) -> bool:
+    """Whether *block* names a file delivered by materializing it into the workspace."""
+    filename = block.get("filename")
+    return (
+        workspace_materialize_upload_limit(filename if isinstance(filename, str) else None)
+        is not None
+    )
 
 
 def _apply_resize_notice_to_latest_image(
@@ -809,11 +828,7 @@ def _file_block_to_input_item(
         marker item when the file failed to materialize; or ``None``
         for an empty text file.
     """
-    filename = block.get("filename")
-    if (
-        workspace_materialize_upload_limit(filename if isinstance(filename, str) else None)
-        is not None
-    ):
+    if _is_workspace_attachment(block):
         return {
             "type": "text",
             "text": routed_attachment_reference_line(block, bridge_dir, workspace),

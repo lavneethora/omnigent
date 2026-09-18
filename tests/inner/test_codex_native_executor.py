@@ -709,6 +709,35 @@ def test_input_file_zip_is_materialized_into_the_workspace(
     assert not (tmp_path / "uploads").exists()
 
 
+def test_zip_submitted_as_an_image_block_still_reaches_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """
+    Delivery follows the stored filename, not the block type.
+
+    A zip uploaded under an image MIME comes back as an ``input_image``
+    block carrying the authoritative filename. Taking the image branch would
+    stage it in the bridge dir and hand codex a localImage it cannot open.
+    """
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    zip_bytes = b"PK\x03\x04 fake zip bytes"
+    block = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(zip_bytes).decode(),
+        "filename": "bundle.zip",
+    }
+
+    items = _content_to_input_items([block], tmp_path, workspace)
+
+    expected = workspace / "session-attachments" / "bundle.zip"
+    assert items == [{"type": "text", "text": f"[Attached file: {expected}]"}]
+    assert expected.read_bytes() == zip_bytes
+    assert not (tmp_path / "uploads").exists()
+
+
 def test_input_file_zip_without_workspace_emits_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

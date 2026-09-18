@@ -5554,7 +5554,9 @@ def _claude_transcript_record_from_session_item(
     if item_type == "message":
         role = item.get("role")
         if role == "user":
-            user_content = _claude_user_content_from_api_blocks(item.get("content"), bridge_dir)
+            user_content = _claude_user_content_from_api_blocks(
+                item.get("content"), bridge_dir, cwd
+            )
             if user_content is None and allow_native_message_content:
                 user_content = _claude_native_message_content(item.get("content"), role="user")
             if user_content is None:
@@ -5733,6 +5735,7 @@ def _synthetic_claude_transcript_uuid(
 def _claude_user_content_from_api_blocks(
     content: object,
     bridge_dir: Path,
+    workspace: Path,
 ) -> str | list[_JsonObject] | None:
     """
     Convert Omnigent user message blocks into Claude message content.
@@ -5749,10 +5752,12 @@ def _claude_user_content_from_api_blocks(
         ``[{"type": "input_text", "text": "hello"}]``.
     :param bridge_dir: Session bridge directory for re-materializing
         attachment blocks.
+    :param workspace: Directory Claude will run in, for attachment types
+        delivered by materializing them there.
     :returns: A string for simple text prompts, a Claude content block
         list for multi-block prompts, or ``None`` when no text exists.
     """
-    blocks = _claude_attachment_text_blocks_from_api_content(content, bridge_dir)
+    blocks = _claude_attachment_text_blocks_from_api_content(content, bridge_dir, workspace)
     blocks += _claude_text_blocks_from_api_content(content, api_type="input_text")
     if not blocks:
         return None
@@ -5765,28 +5770,29 @@ def _claude_user_content_from_api_blocks(
 def _claude_attachment_text_blocks_from_api_content(
     content: object,
     bridge_dir: Path,
+    workspace: Path,
 ) -> list[_JsonObject]:
     """
     Re-materialize attachment blocks as transcript text references.
 
     Routes each block exactly as a live turn does, so a resume after runner
     replacement reaches the same file: inlinable types are decoded to
-    ``<bridge_dir>/uploads/``, archives and other workspace-delivered types to
-    the launch workspace recorded in the bridge config. A block whose bytes
-    never arrived yields the could-not-load placeholder instead of vanishing
-    from the rebuilt transcript.
+    ``<bridge_dir>/uploads/``, archives and other workspace-delivered types
+    into *workspace*. The caller supplies that path because a rebuild runs
+    before the bridge config for the replacement launch exists. A block whose
+    bytes never arrived yields the could-not-load placeholder instead of
+    vanishing from the rebuilt transcript.
 
     :param content: Omnigent content array, e.g.
         ``[{"type": "input_image", "image_url": "data:image/png;..."}]``.
     :param bridge_dir: Session bridge directory to write files under.
+    :param workspace: Directory Claude will run in.
     :returns: Claude ``{"type": "text", "text": ...}`` blocks.
     """
-    from omnigent.harnesses.claude_native.bridge import read_bridge_workspace
     from omnigent.inner.native_attachments import routed_attachment_reference_line
 
     if not isinstance(content, list):
         return []
-    workspace = read_bridge_workspace(bridge_dir)
     blocks: list[_JsonObject] = []
     for value in content:
         block = _json_object(value)

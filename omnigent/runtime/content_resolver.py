@@ -672,7 +672,10 @@ def extract_text_attachments(
 
     attachments: list[dict[str, str]] = []
     for block in content:
-        if not isinstance(block, dict) or block.get("type") != "input_file":
+        # Both block types are considered: delivery follows the stored filename,
+        # so a workspace file a client sent as an image still reaches the
+        # sandbox and must be announced. Images stay skipped by the text test.
+        if not isinstance(block, dict) or block.get("type") not in ("input_file", "input_image"):
             continue
         file_id = block.get("file_id")
         if not isinstance(file_id, str):
