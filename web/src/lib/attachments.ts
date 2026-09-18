@@ -66,6 +66,7 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".md",
   ".markdown",
   ".csv",
+  ".tsv",
   ".json",
   ".jsonl",
   ".ndjson",
