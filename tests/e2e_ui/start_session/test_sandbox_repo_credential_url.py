@@ -157,8 +157,10 @@ def test_credential_repo_url_never_leaves_the_browser(page: Page, live_server: s
 
     page.get_by_test_id("new-chat-landing-input").fill("Audit this repository.")
     with page.expect_response(
-        lambda response: response.request.method == "POST"
-        and response.url.split("?")[0].rstrip("/").endswith("/v1/sessions"),
+        lambda response: (
+            response.request.method == "POST"
+            and response.url.split("?")[0].rstrip("/").endswith("/v1/sessions")
+        ),
         timeout=30_000,
     ) as create_info:
         page.get_by_test_id("new-chat-landing-submit").click()
