@@ -8124,6 +8124,67 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     return canonicalize_harness(spec.executor.harness_kind) in _CURSOR_FORK_HISTORY_HARNESSES
 
 
+def _filesystem_attachment_in_history(
+    session_id: str,
+    conversation_store: ConversationStore,
+    file_store: FileStore | None,
+    *,
+    up_to_response_id: str | None = None,
+    content: Sequence[dict[str, Any]] = (),
+) -> str | None:
+    """Find a retained attachment requiring filesystem tools, using its stored name.
+
+    :param session_id: Source session whose history will be retained.
+    :param conversation_store: Store containing the ordered source history.
+    :param file_store: Store containing authoritative attachment filenames.
+    :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param content: Additional incoming message blocks to check before stored history.
+    :returns: A referenced filesystem attachment's name, or ``None``.
+    """
+    from omnigent.inner.native_attachments import requires_filesystem
+
+    if file_store is None:
+        return None
+    filenames: dict[str, str] = {}
+    files_after: str | None = None
+    while True:
+        files_page = file_store.list(session_id, limit=1000, after=files_after, order="asc")
+        for stored_file in files_page.data:
+            if requires_filesystem(stored_file.filename):
+                filenames[stored_file.id] = stored_file.filename
+        if not files_page.has_more or not files_page.data:
+            break
+        files_after = files_page.last_id
+    if not filenames:
+        return None
+
+    for block in content:
+        file_id = block.get("file_id")
+        if isinstance(file_id, str) and file_id in filenames:
+            return filenames[file_id]
+
+    # Descending order finds the last item of the cutoff response first,
+    # matching the fork store's inclusive position cutoff.
+    retained = up_to_response_id is None
+    items_after: str | None = None
+    while True:
+        page = conversation_store.list_items(
+            session_id, limit=1000, after=items_after, order="desc"
+        )
+        for item in page.data:
+            if item.response_id == up_to_response_id:
+                retained = True
+            if not retained or not isinstance(item.data, MessageData):
+                continue
+            for block in item.data.content:
+                file_id = block.get("file_id")
+                if isinstance(file_id, str) and file_id in filenames:
+                    return filenames[file_id]
+        if not page.has_more or not page.data:
+            return None
+        items_after = page.last_id
+
+
 def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
     """
     Return native coding-agent metadata for an agent's harness.
@@ -10647,6 +10708,52 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
 
 # Page size for walking a session's files when totalling its filesystem attachments.
 _FILESYSTEM_QUOTA_PAGE_SIZE = 100
+
+
+def require_filesystem_attachment_runtime(
+    *,
+    host_id: str | None,
+    runner_id: str | None,
+    host_registry: HostRegistry | None,
+    tunnel_registry: TunnelRegistry | None,
+    runner_router: RunnerRouter | None = None,
+) -> None:
+    """Require a connected build that can deliver and restore native file attachments.
+
+    :param host_id: Session's assigned host, or None before host selection.
+    :param runner_id: Session's current runner, when already launched.
+    :param host_registry: Live host connections on this server replica.
+    :param tunnel_registry: Live runner connections on this server replica.
+    :param runner_router: Router used to distinguish a remote host from an offline one.
+    :raises OmnigentError: When the runtime needs an upgrade, connection, or reroute.
+    """
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+
+    host = host_registry.get(host_id) if host_id and host_registry is not None else None
+    runner = tunnel_registry.get(runner_id) if runner_id and tunnel_registry is not None else None
+    for connection in (host, runner):
+        if (
+            connection is not None
+            and CAP_FILESYSTEM_ATTACHMENTS not in connection.hello.capabilities
+        ):
+            raise OmnigentError(
+                "Update Omnigent on this host and restart it before attaching archives, "
+                "Office documents, or databases. This host cannot restore these files "
+                "when a session resumes.",
+                code=ErrorCode.CONFLICT,
+            )
+    if host is not None or runner is not None:
+        return
+    if host_id and runner_router is not None and runner_router.host_is_on_another_replica(host_id):
+        raise OmnigentError(
+            "Attachment support must be checked on the host's server replica",
+            code=ErrorCode.WRONG_REPLICA,
+        )
+    raise OmnigentError(
+        "Connect an updated Omnigent host before attaching archives, Office documents, "
+        "or databases, then retry.",
+        code=ErrorCode.CONFLICT,
+    )
 
 
 def _enforce_filesystem_attachment_policy(

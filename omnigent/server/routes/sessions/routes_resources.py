@@ -75,6 +75,7 @@ from omnigent.server.routes._sessions.helpers import (
     FILE_CONTENT_CACHE_CONTROL,
     _ancestor_session_ids,
     _attachment_disposition,
+    _await_settled_managed_launch,
     _enforce_filesystem_attachment_policy,
     _file_content_etag,
     _get_runner_client_for_resource_access,
@@ -88,6 +89,7 @@ from omnigent.server.routes._sessions.helpers import (
     _raise_if_session_agent_missing_payload,
     _read_upload_capped,
     _stored_file_to_resource,
+    require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
@@ -198,6 +200,50 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
 ) -> None:
     """Register the resources routes on router."""
+
+    async def _require_filesystem_attachment_support(
+        request: Request, conv: Conversation, filename: str
+    ) -> None:
+        await _require_filesystem_attachment_harness(conv, filename)
+        tracker = getattr(request.app.state, "managed_launches", None)
+        launch = tracker.get(conv.id) if tracker is not None else None
+        if launch is not None and conv.host_id is None and conv.runner_id is None:
+            await _await_settled_managed_launch(launch)
+            refreshed = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+            if refreshed is None:
+                raise _session_not_found()
+            conv = refreshed
+        tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+        if (
+            conv.host_id is not None
+            and host_registry is not None
+            and host_registry.get(conv.host_id) is None
+            and (
+                conv.runner_id is None
+                or tunnel_registry is None
+                or tunnel_registry.get(conv.runner_id) is None
+            )
+            and not (
+                runner_router is not None
+                and await asyncio.to_thread(runner_router.host_is_on_another_replica, conv.host_id)
+            )
+        ):
+            # Upload can be the first action after a managed sandbox sleeps.
+            _, conv = await ensure_runner_connected(
+                session_id=conv.id,
+                conv=conv,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+            )
+        await asyncio.to_thread(
+            require_filesystem_attachment_runtime,
+            host_id=conv.host_id,
+            runner_id=conv.runner_id,
+            host_registry=host_registry,
+            tunnel_registry=tunnel_registry,
+            runner_router=runner_router,
+        )
 
     @router.get(
         "/sessions/{session_id}/resources",
@@ -1632,7 +1678,7 @@ def register_resources_routes(
         if filesystem_required:
             # Drop the declared type so the file is never stored as text.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
-            await _require_filesystem_attachment_harness(conv, file.filename)
+            await _require_filesystem_attachment_support(request, conv, file.filename)
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
@@ -1984,8 +2030,8 @@ def register_resources_routes(
             if stored.filename and requires_filesystem(stored.filename)
         ]
         if filesystem_sources:
-            await _require_filesystem_attachment_harness(
-                conv, filesystem_sources[0].filename or ""
+            await _require_filesystem_attachment_support(
+                request, conv, filesystem_sources[0].filename or ""
             )
         attachment_lock = (
             _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()

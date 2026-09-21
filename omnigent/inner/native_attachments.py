@@ -103,6 +103,9 @@ _FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
 # Harnesses supporting uploads and history restoration for these file formats.
 FILESYSTEM_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "codex-native"})
 
+# Advertised by builds that can deliver and restore these attachments.
+CAP_FILESYSTEM_ATTACHMENTS = "filesystem_attachments"
+
 
 def requires_filesystem(filename: str | None) -> bool:
     """

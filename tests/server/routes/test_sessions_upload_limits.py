@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from unittest.mock import Mock
 
 import pytest
 from fastapi import FastAPI, Request
@@ -11,10 +12,12 @@ from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
 from omnigent.runtime.content_resolver import (
     MAX_TEXT_UPLOAD_BYTES,
 )
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -41,8 +44,24 @@ def upload_client(db_uri: str, tmp_path) -> Iterator[tuple[TestClient, str]]:
     )
     # A Claude Code session, so filesystem types are accepted.
     conversation_store.set_labels(conv.id, CLAUDE_NATIVE_CODING_AGENT.presentation_labels)
+    conversation_store.set_host_id(
+        conv.id, "d75381f2c94b4e49a3c684946d4ddbc4", workspace=str(tmp_path)
+    )
+    host_registry = HostRegistry()
+    host_registry.register(
+        "d75381f2c94b4e49a3c684946d4ddbc4",
+        Mock(),
+        HostHelloFrame(
+            version="0.15.0",
+            frame_protocol_version=1,
+            name="upload",
+            capabilities=HOST_CAPABILITIES,
+        ),
+        owner=None,
+    )
 
     app = FastAPI()
+    app.state.host_registry = host_registry
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(request: Request, exc: OmnigentError) -> JSONResponse:
@@ -58,6 +77,7 @@ def upload_client(db_uri: str, tmp_path) -> Iterator[tuple[TestClient, str]]:
             agent_store=agent_store,
             file_store=file_store,
             artifact_store=artifact_store,
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -521,3 +541,149 @@ def test_quota_counts_filesystem_files_past_any_page_boundary(
         )
 
     assert exc.value.status_code == 413
+
+
+@pytest.mark.parametrize("filename", ["archive.zip", "report.docx", "state.sqlite"])
+def test_old_host_refuses_new_types_without_storing(
+    upload_client: tuple[TestClient, str], db_uri: str, filename: str
+) -> None:
+    """A legacy hello cannot promise cold resume; rejection leaves no file row."""
+    client, session_id = upload_client
+    client.app.state.host_registry.get("d75381f2c94b4e49a3c684946d4ddbc4").hello.capabilities = []
+    response = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": (filename, b"data", "application/octet-stream")},
+    )
+    assert response.status_code == 409, response.text
+    assert "Update Omnigent" in response.text
+    assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
+
+
+def test_old_host_keeps_existing_attachment_types(upload_client: tuple[TestClient, str]) -> None:
+    """The upgrade requirement does not change existing text/image uploads."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    client, session_id = upload_client
+    client.app.state.host_registry.get("d75381f2c94b4e49a3c684946d4ddbc4").hello.capabilities = []
+    image = BytesIO()
+    Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+    for filename, data, mime in (
+        ("table.csv", b"a,b\n1,2\n", "text/csv"),
+        ("picture.png", image.getvalue(), "image/png"),
+    ):
+        response = client.post(
+            f"/v1/sessions/{session_id}/resources/files",
+            files={"file": (filename, data, mime)},
+        )
+        assert response.status_code == 201, response.text
+
+
+@pytest.mark.asyncio
+async def test_first_managed_upload_waits_for_host_binding(
+    upload_client: tuple[TestClient, str], db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upload racing provisioning waits, then checks the newly bound host."""
+    import asyncio
+
+    import httpx
+
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.routes.sessions import routes_resources
+
+    client, session_id = upload_client
+    store = SqlAlchemyConversationStore(db_uri)
+    store.clear_host_binding(session_id)
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    client.app.state.managed_launches = tracker
+    waiting = asyncio.Event()
+    original = routes_resources._await_settled_managed_launch
+
+    async def observe_wait(launch):
+        waiting.set()
+        await original(launch)
+
+    monkeypatch.setattr(routes_resources, "_await_settled_managed_launch", observe_wait)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=client.app), base_url="http://test"
+    ) as async_client:
+        upload = asyncio.create_task(
+            async_client.post(
+                f"/v1/sessions/{session_id}/resources/files",
+                files={"file": ("archive.zip", b"data", "application/zip")},
+            )
+        )
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        assert not upload.done()
+        assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
+        store.set_host_id(
+            session_id, "d75381f2c94b4e49a3c684946d4ddbc4", workspace="/tmp/test-upload"
+        )
+        tracker.finish(session_id)
+        response = await upload
+    assert response.status_code == 201, response.text
+
+
+def test_recovered_host_ignores_stale_managed_launch_failure(
+    upload_client: tuple[TestClient, str],
+) -> None:
+    """A retained failure does not block uploads after the session has recovered."""
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+
+    client, session_id = upload_client
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    tracker.fail(session_id, "earlier provision failed")
+    client.app.state.managed_launches = tracker
+    response = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"data", "application/zip")},
+    )
+    assert response.status_code == 201, response.text
+
+
+def test_unbound_upload_requires_a_connected_runtime(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+) -> None:
+    """An unknown host cannot be assumed current just because the server is new."""
+    client, session_id = upload_client
+    SqlAlchemyConversationStore(db_uri).clear_host_binding(session_id)
+    response = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"data", "application/zip")},
+    )
+    assert response.status_code == 409, response.text
+    assert "Connect an updated" in response.text
+    assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
+
+
+def test_upload_wakes_a_sleeping_runtime_before_checking_support(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first attachment can wake a managed sandbox without requiring a text turn."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes.sessions import routes_resources
+
+    client, session_id = upload_client
+    registry = client.app.state.host_registry
+    connection = registry.get("d75381f2c94b4e49a3c684946d4ddbc4")
+    registry.deregister(connection.host_id)
+
+    async def wake(**kwargs):
+        registry.register(connection.host_id, Mock(), connection.hello, owner=None)
+        return None, SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+
+    ensure = AsyncMock(side_effect=wake)
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", ensure)
+    response = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"data", "application/zip")},
+    )
+    assert response.status_code == 201, response.text
+    ensure.assert_awaited_once()

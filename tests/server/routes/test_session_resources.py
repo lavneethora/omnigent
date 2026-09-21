@@ -8,6 +8,7 @@ import logging
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -16,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
@@ -1976,6 +1977,21 @@ def file_app(
     del runner_globals_reset
 
     test_app = FastAPI()
+    host_registry = HostRegistry()
+    host_registry.register(
+        "host_files",
+        Mock(),
+        HostHelloFrame(
+            version="0.15.0",
+            frame_protocol_version=1,
+            name="files",
+            capabilities=HOST_CAPABILITIES,
+        ),
+        owner=None,
+    )
+    test_app.state.host_registry = host_registry
+    for session_id in ("64a784c3aa907d1774f44313546947c6", "405bfe154d5c0e795a2b87021bc897bf"):
+        file_conv_store._conversations[session_id].host_id = "host_files"
 
     @test_app.exception_handler(OmnigentError)
     async def _handle(
@@ -1996,6 +2012,7 @@ def file_app(
             _NoAgentStore(),  # type: ignore[arg-type]
             file_store=file_store,  # type: ignore[arg-type]
             artifact_store=artifact_store,  # type: ignore[arg-type]
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -7272,3 +7289,75 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     assert response.status_code == 200, response.text
     assert captured["op"] == "github_prs_update"
     assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}
+
+
+@pytest.mark.asyncio
+async def test_copy_new_type_refuses_old_runtime(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A capable harness on an old host cannot receive a copied binary file."""
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    child = "405bfe154d5c0e795a2b87021bc897bf"
+    parent = "b460374fc8e697b296708f52dc9d8179"
+    file_conv_store._conversations[child].labels.update(
+        CLAUDE_NATIVE_CODING_AGENT.presentation_labels
+    )
+    file_app.state.host_registry.get("host_files").hello.capabilities = []
+    file_id = _seed_parent_zip(file_store, artifact_store, "archive.zip")
+    response = await file_client.post(
+        f"/v1/sessions/{child}/resources/files:copy",
+        json={"source_session_id": parent, "file_ids": [file_id]},
+    )
+    assert response.status_code == 409, response.text
+    assert file_store.list(child).data == []
+    assert file_store.get(file_id, session_id=parent) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained_history", [False, True])
+async def test_native_send_rechecks_runtime_after_upload(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    retained_history: bool,
+) -> None:
+    """A downgrade/fork binding rejects incoming and retained files before dispatch."""
+    from omnigent.entities import MessageData
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    set_runner_client(runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"data", "application/zip")},
+    )
+    assert upload.status_code == 201, upload.text
+    block = {"type": "input_file", "file_id": upload.json()["id"], "filename": "renamed.txt"}
+    content = [block]
+    if retained_history:
+        file_conv_store.appended_items.append(
+            ConversationItem(
+                id="f" * 32,
+                type="message",
+                status="completed",
+                response_id="e" * 32,
+                created_at=1,
+                data=MessageData(role="user", content=content),
+            )
+        )
+        content = [{"type": "input_text", "text": "Read the attached archive again"}]
+    file_app.state.host_registry.get("host_files").hello.capabilities = []
+    response = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+    assert response.status_code == 409, response.text
+    assert "Update Omnigent" in response.text
+    assert runner.post_json_calls == []
+    assert len(file_conv_store.appended_items) == 1 + int(retained_history)

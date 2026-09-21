@@ -147,6 +147,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_skill_slash_command_policy_body,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
+    _filesystem_attachment_in_history,
     _forward_session_change_to_runner,
     _get_runner_client,
     _get_runner_client_for_resource_access,
@@ -191,6 +192,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stream_live_events,
     _wait_for_runner_client,
     reconcile_orphaned_running_status,
+    require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -2078,6 +2080,26 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        # Recheck the bound runtime: forks and host restarts can change it
+        # after upload, while retained history still needs these files.
+        if body.type in ("message", _SLASH_COMMAND_TYPE) and _is_native_terminal_session(conv):
+            content = body.data.get("content")
+            attachment = await asyncio.to_thread(
+                _filesystem_attachment_in_history,
+                session_id,
+                conversation_store,
+                file_store,
+                content=content if isinstance(content, list) else [],
+            )
+            if attachment is not None:
+                await asyncio.to_thread(
+                    require_filesystem_attachment_runtime,
+                    host_id=conv.host_id,
+                    runner_id=conv.runner_id,
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                    tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    runner_router=runner_router,
+                )
         native_terminal_ready = False
         if _runner_needs_session_init:
             # The runner was unavailable when this request began, so its

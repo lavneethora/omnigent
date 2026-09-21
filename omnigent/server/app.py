@@ -1524,6 +1524,8 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        conversation_store=conversation_store,
+        file_store=file_store,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
