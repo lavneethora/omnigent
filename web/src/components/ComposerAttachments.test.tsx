@@ -51,16 +51,15 @@ describe("ComposerAttachments", () => {
     expect(screen.queryByRole("img")).toBeNull();
   });
 
-  it("labels a workspace-delivered file and names its destination", () => {
-    renderList([new File([new Uint8Array(4)], "bundle.zip", { type: "application/zip" })]);
-    expect(screen.getByText("workspace")).toBeInTheDocument();
-    expect(
-      screen.getByTitle(/bundle\.zip will be placed in the session workspace/),
-    ).toBeInTheDocument();
-  });
-
-  it("leaves an inlined file unlabelled", () => {
-    renderList([new File([new Uint8Array(4)], "notes.txt", { type: "text/plain" })]);
+  it.each([
+    ["bundle.zip", "ZIP"],
+    ["report.docx", "DOCX"],
+    ["app.sqlite", "SQLITE"],
+  ])("shows %s as an ordinary file card", (name, type) => {
+    renderList([new File([new Uint8Array(4)], name)]);
+    expect(screen.getByText(name)).toBeInTheDocument();
+    expect(screen.getByText(`${type} · 4 B`)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Remove ${name}` })).toBeInTheDocument();
     expect(screen.queryByText("workspace")).toBeNull();
   });
 

@@ -721,9 +721,9 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
         if body.type == "message":
-            from omnigent.inner.native_attachments import inline_workspace_attachment_name
+            from omnigent.inner.native_attachments import inline_filesystem_attachment_name
 
-            inline_name = inline_workspace_attachment_name(body.data.get("content"))
+            inline_name = inline_filesystem_attachment_name(body.data.get("content"))
             if inline_name is not None:
                 raise OmnigentError(
                     f"Attachment {inline_name!r} must be uploaded to the session's "

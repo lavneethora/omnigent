@@ -32,6 +32,8 @@ from typing import Any, Literal
 
 import httpx
 
+from omnigent.process_logging import data_dir
+
 _logger = logging.getLogger(__name__)
 
 # Characters that would corrupt a "[Attached: ...]" / "[Attachment ...]"
@@ -86,59 +88,39 @@ def parse_data_uri(uri: str) -> DataUri:
     return DataUri(mime_type=mime_part, base64_payload=payload)
 
 
-# Subdirectory of the harness workspace that user-attached files land in.
-WORKSPACE_ATTACHMENTS_DIRNAME = "session-attachments"
+# Upload limits for files that the harness opens with filesystem tools.
+# The server enforces these per session, including copies between sessions.
+MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
+MAX_SESSION_FILESYSTEM_ATTACHMENTS: int = 20
+MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES: int = 200 * 1024 * 1024
 
-# Default per-file cap and per-session quotas for workspace-materialized
-# attachments. They bound sandbox disk usage rather than a base64 request
-# payload, so they sit well above the inline caps. The server enforces them per
-# session at upload (see omnigent/server/server_config.py for the overrides);
-# the runner cannot, because one workspace is shared by many sessions.
-MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
-MAX_SESSION_WORKSPACE_ATTACHMENTS: int = 20
-MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES: int = 200 * 1024 * 1024
-
-# Extensions delivered by materializing to the workspace instead of inlining.
-# Office formats and archives are zip containers that browsers and OSes
-# routinely mislabel as application/zip or application/octet-stream, so the
-# check is extension-based rather than content-type-based. Kept a fixed
-# allowlist rather than "any binary": until deployments can configure a
-# denylist, an open default would let arbitrary executables into the sandbox.
-_WORKSPACE_MATERIALIZE_EXTENSIONS: frozenset[str] = frozenset(
+# These formats require the harness's filesystem tools. Match by extension
+# because browsers can mislabel Office documents as ZIP or generic binary data.
+_FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
     {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}
 )
 
-# Harnesses whose executors materialize workspace attachments. Any other harness
-# would receive the file inlined and drop it, so the upload is refused instead.
-WORKSPACE_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "codex-native"})
+# Harnesses supporting uploads and history restoration for these file formats.
+FILESYSTEM_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "codex-native"})
 
 
-def workspace_materialize_upload_limit(filename: str | None) -> int | None:
+def requires_filesystem(filename: str | None) -> bool:
     """
-    Max size (bytes) for a workspace-materialized attachment, or ``None``
-    when *filename*'s extension is not one.
-
-    These types are never inlined into the model context: a filesystem-capable
-    harness (Claude Code, Codex) writes them into its workspace and references
-    them by path, so adapters without a filesystem must reject them rather
-    than send bytes the provider cannot interpret.
+    Whether an attachment needs a harness that can open local files.
 
     :param filename: The original filename, e.g. ``"report.docx"``.
-    :returns: :data:`MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES`, or ``None`` when
-        the extension is not a workspace-materialize type.
+    :returns: True for supported archives, Office documents, and databases.
     """
-    if not filename:
-        return None
-    if PurePath(filename).suffix.lower() not in _WORKSPACE_MATERIALIZE_EXTENSIONS:
-        return None
-    return MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
+    return bool(
+        filename and PurePath(filename).suffix.lower() in _FILESYSTEM_ATTACHMENT_EXTENSIONS
+    )
 
 
-def inline_workspace_attachment_name(content: object) -> str | None:
+def inline_filesystem_attachment_name(content: object) -> str | None:
     """
-    Filename of the first workspace-type attachment that carries inline bytes.
+    Filename of the first attachment requiring filesystem tools with inline bytes.
 
-    Workspace files must arrive as uploaded ``file_id`` references, so the
+    These files must arrive as uploaded ``file_id`` references, so the
     upload route's harness, denylist, and quota checks run before any bytes
     reach the sandbox.
 
@@ -151,25 +133,36 @@ def inline_workspace_attachment_name(content: object) -> str | None:
         if not isinstance(block, dict):
             continue
         filename = block.get("filename")
-        if not isinstance(filename, str) or workspace_materialize_upload_limit(filename) is None:
+        if not isinstance(filename, str) or not requires_filesystem(filename):
             continue
         if block.get("file_data") or block.get("image_url"):
             return filename
     return None
 
 
+def attachment_cache_dir(bridge_dir: Path) -> Path:
+    """Return the local attachment cache for a native session's bridge.
+
+    The bridge path identifies the session across live turns and resume rebuilds.
+    All harnesses share ``~/.omnigent/attachments/`` (or ``OMNIGENT_DATA_DIR``).
+    """
+    key = hashlib.sha256(os.fsencode(bridge_dir.resolve())).hexdigest()[:32]
+    return data_dir().resolve() / "attachments" / key
+
+
 def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Path | None:
     """
-    Decode a base64 data URI from a content block and write it to disk.
+    Decode an attachment into the session's cache outside the working directory.
+
+    The artifact store retains the original upload. Local copies are recreated
+    when rebuilding history. Files are never extracted or made executable.
 
     :param block: A content block dict with ``type`` of
         ``"input_image"`` or ``"input_file"``. Expected to carry a
         resolved data URI in ``image_url`` or ``file_data``,
         e.g. ``"data:image/png;base64,iVBOR..."``. May also carry a
         ``filename``, e.g. ``"diagram.png"``.
-    :param bridge_dir: Bridge directory path. Files are written to an
-        ``uploads/`` subdirectory underneath it,
-        e.g. ``Path("/tmp/omnigent/codex-native/<digest>")``.
+    :param bridge_dir: Session bridge path, used to identify its attachment cache.
     :returns: Path to the written file, or ``None`` if the block could
         not be materialized (missing data URI, decode error).
     """
@@ -178,17 +171,43 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         return None
     raw_bytes, filename = decoded
 
-    uploads_dir = bridge_dir / "uploads"
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    dest = uploads_dir / filename
-    if dest.exists() and not _holds_bytes(dest, raw_bytes):
-        # Same name, different bytes. Deriving the suffix from the content keeps
-        # one file per payload, where a random one grew a copy per rebuild.
+    if filename in (".", "..") or os.sep in filename:
+        return None
+
+    attachments_dir = attachment_cache_dir(bridge_dir)
+    try:
+        attachments_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_fd = os.open(attachments_dir.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(attachments_dir.name, mode=0o700, dir_fd=root_fd)
+            dir_fd = os.open(
+                attachments_dir.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+        finally:
+            os.close(root_fd)
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
+        return None
+    try:
+        stem, suffix = os.path.splitext(filename)
         digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
-        dest = dest.with_stem(f"{dest.stem}_{digest}")
-    if not _holds_bytes(dest, raw_bytes):
-        dest.write_bytes(raw_bytes)
-    return dest
+        for name in (filename, f"{stem}_{digest}{suffix}"):
+            outcome = _place_no_follow(dir_fd, name, raw_bytes)
+            if outcome == "symlink":
+                _logger.warning("Refusing to write through symlink %s", attachments_dir / name)
+                return None
+            if outcome == "placed":
+                return attachments_dir / name
+        _logger.warning("Attachment names for %s already hold other content", filename)
+        return None
+    except OSError:
+        _logger.warning("Failed to materialize attachment %s", filename, exc_info=True)
+        return None
+    finally:
+        os.close(dir_fd)
 
 
 def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] | None:
@@ -227,65 +246,6 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
         # "passwd" and a traversal attempt can't escape the destination dir.
         filename = Path(filename).name or f"attachment_{uuid.uuid4().hex[:8]}{ext}"
     return raw_bytes, _MARKER_UNSAFE.sub("_", filename)
-
-
-def materialize_attachment_to_workspace(
-    block: Mapping[str, object], workspace: Path
-) -> Path | None:
-    """
-    Write an attachment into the harness workspace for the agent to open.
-
-    Unlike :func:`materialize_attachment`, which stages inlinable files in
-    the bridge directory, this places the file under the workspace the
-    harness already runs in, so its own Read/Bash tools reach it without a
-    sandbox exception. The bytes are written verbatim: archives are never
-    extracted, and the execute bits are always cleared so a materialized
-    file can't be run.
-
-    The workspace may hold files someone else prepared, so every open is
-    relative to a no-follow handle on the attachments directory and new files
-    are created exclusively. A symlink planted at the destination, or at the
-    collision name, fails the open instead of redirecting the write.
-
-    :param block: Attachment content block (see
-        :func:`materialize_attachment`).
-    :param workspace: Harness workspace root, e.g. ``Path("/home/me/repo")``.
-    :returns: Path to the materialized file, or ``None`` when the block could
-        not be materialized: undecodable, a symlink in the way, or both the
-        original and collision names already holding other content.
-    """
-    decoded = _decode_attachment_block(block)
-    if decoded is None:
-        return None
-    raw_bytes, filename = decoded
-    if filename in (".", "..") or os.sep in filename:
-        return None
-
-    attachments_dir = workspace.resolve() / WORKSPACE_ATTACHMENTS_DIRNAME
-    try:
-        attachments_dir.mkdir(parents=True, exist_ok=True)
-        # O_NOFOLLOW refuses a symlinked attachments directory outright.
-        dir_fd = os.open(attachments_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError:
-        _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
-        return None
-    try:
-        stem, suffix = os.path.splitext(filename)
-        digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
-        for name in (filename, f"{stem}_{digest}{suffix}"):
-            outcome = _place_no_follow(dir_fd, name, raw_bytes)
-            if outcome == "symlink":
-                _logger.warning("Refusing to write through symlink %s", attachments_dir / name)
-                return None
-            if outcome == "placed":
-                return attachments_dir / name
-        _logger.warning("Attachment names for %s already hold other content", filename)
-        return None
-    except OSError:
-        _logger.warning("Failed to materialize attachment %s", filename, exc_info=True)
-        return None
-    finally:
-        os.close(dir_fd)
 
 
 def _place_no_follow(
@@ -341,10 +301,9 @@ def _create_no_follow(
     :raises OSError: When the write fails; the partial file is removed.
     """
     try:
-        # Mode 0o644 carries no execute bits, and O_EXCL never follows or
-        # reuses an existing entry, a dangling symlink included.
+        # Private, non-executable files; existing entries are never overwritten.
         fd = os.open(
-            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
         )
     except FileExistsError:
         return "taken"
@@ -382,30 +341,13 @@ def _read_fd(fd: int, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def _holds_bytes(path: Path, raw_bytes: bytes) -> bool:
-    """
-    True if *path* already holds exactly *raw_bytes*.
-
-    :param path: Candidate destination that may or may not exist.
-    :param raw_bytes: Decoded attachment payload.
-    :returns: Whether the existing file can be reused as-is. The size
-        check short-circuits the read for the common mismatch.
-    """
-    if not path.exists():
-        return False
-    return path.stat().st_size == len(raw_bytes) and path.read_bytes() == raw_bytes
-
-
 # Regex source matching the exact line unresolved_attachment_marker() emits.
 # Consumers (title synthesis, TUI forwarders) compose their marker-matching
 # patterns from this so the shapes cannot drift apart.
 UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded\]"
 
-# Matches any attachment reference line this module emits — the success-path
-# "[Attached: <path>]" from attachment_reference_line(), the workspace
-# "[Attached file: <path>]" from workspace_attachment_reference_line(), and
-# the unresolved marker. TUI forwarders strip these from mirrored bubbles
-# (internal bridge details that must not leak into the chat transcript).
+# TUI forwarders strip local file paths from mirrored chat bubbles.
+# Codex's binary file inputs also use the "[Attached file: ...]" shape.
 ATTACHMENT_MARKER_STRIP_PATTERN = (
     rf"\[Attached(?: file)?:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
 )
@@ -441,7 +383,7 @@ def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> 
 
     :param block: Attachment content block (see
         :func:`materialize_attachment`).
-    :param bridge_dir: Bridge directory the file is written under.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: ``"[Attached: <path>]"`` on success, else the visible
         marker from :func:`unresolved_attachment_marker`.
     """
@@ -449,50 +391,6 @@ def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> 
     if path is not None:
         return f"[Attached: {path}]"
     return unresolved_attachment_marker(block)
-
-
-def workspace_attachment_reference_line(block: Mapping[str, object], workspace: Path) -> str:
-    """
-    Materialize *block* into *workspace* and return its transcript line.
-
-    Uses the ``"[Attached file: <path>]"`` shape codex-native already emits,
-    which the harness echoes back and title seeding strips (see
-    :data:`ATTACHMENT_MARKER_STRIP_PATTERN`).
-
-    :param block: Attachment content block (see
-        :func:`materialize_attachment_to_workspace`).
-    :param workspace: Harness workspace root the file is written under.
-    :returns: ``"[Attached file: <path>]"`` on success, else the visible
-        marker from :func:`unresolved_attachment_marker`.
-    """
-    path = materialize_attachment_to_workspace(block, workspace)
-    if path is not None:
-        return f"[Attached file: {path}]"
-    return unresolved_attachment_marker(block)
-
-
-def routed_attachment_reference_line(
-    block: Mapping[str, object], bridge_dir: Path, workspace: Path | None
-) -> str:
-    """
-    Reference line for one attachment, routed by its delivery mode.
-
-    Shared by live turns and transcript rebuilds so both deliver an attachment
-    the same way.
-
-    :param block: Attachment content block.
-    :param bridge_dir: Bridge directory for inlinable types.
-    :param workspace: Workspace root for materialized types, or ``None`` when
-        the launch recorded none.
-    :returns: The line referencing the materialized file, or a visible marker
-        when it could not be placed.
-    """
-    filename = block.get("filename")
-    if workspace_materialize_upload_limit(filename if isinstance(filename, str) else None) is None:
-        return attachment_reference_line(block, bridge_dir)
-    if workspace is None:
-        return unresolved_attachment_marker(block)
-    return workspace_attachment_reference_line(block, workspace)
 
 
 def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
@@ -695,7 +593,7 @@ async def resolve_file_id_block(
     stored_name = meta.get("name")
     if isinstance(stored_name, str) and stored_name:
         # The stored name decides delivery. The block's own filename comes from
-        # the client and could steer an upload past the workspace checks.
+        # the client and could steer an upload past the upload checks.
         new_block["filename"] = stored_name
     notice: dict[str, int] | None = None
     if block.get("type") == "input_image":

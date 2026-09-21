@@ -39,17 +39,12 @@ from pathlib import Path
 from playwright.sync_api import Page, Route, expect
 
 _COMPOSER = "Send a message…"
-# Composer accepts image/*,application/pdf,text/*,application/json plus the
-# workspace-delivered extensions (the hidden input's accept attr); a .txt file
-# is in-scope, inlined rather than workspace-delivered, and keeps it trivial.
-# ``set_input_files`` bypasses the accept filter, but ``addFiles`` now validates
-# every file (type + size, via lib/attachments.ts) — a .txt passes both.
+# A text file passes both the OS picker filter and client validation.
 _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
 
 # An unsupported type: ``addFiles`` rejects it (no chip) and shows an inline
-# error. Media is the remaining unsupported shape; office documents and
-# archives are now workspace-delivered rather than rejected.
+# error. Office documents and archives are accepted.
 _MEDIA_NAME = "clip.mp4"
 
 # JSON is its own MIME (``application/json``), which is NOT covered by the
@@ -58,16 +53,14 @@ _MEDIA_NAME = "clip.mp4"
 _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
 
-# A zip is the case users actually hit (dragging an iCloud Photos export).
-# It is now accepted and delivered to the session workspace rather than
-# inlined, so the chip carries a "workspace" label.
+# A ZIP is a common input, such as an iCloud Photos export.
 _ZIP_NAME = "photos.zip"
 
 # The server's real 415 body for an unsupported upload, from
 # ``routes_resources.upload_session_file``. Used to drive the failed-send path.
 _SERVER_415_DETAIL = (
-    "Unsupported attachment type 'application/zip'. Only images, PDF, "
-    "and text/code files can be attached."
+    "Unsupported attachment type 'video/mp4'. Attach images, PDF, or text/code files, "
+    "or use Claude Code or Codex for archives, Office documents, and databases."
 )
 
 
@@ -134,23 +127,10 @@ def test_attach_json_file(page: Page, seeded_session: tuple[str, str], tmp_path:
     expect(page.get_by_text(_JSON_NAME, exact=True)).to_be_visible()
 
 
-def test_attach_zip_is_labelled_workspace_delivered(
+def test_attach_zip_as_file_card(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    """A ``.zip`` attaches and its chip says the file goes to the workspace.
-
-    Archives are not inlined into the model context: the server stores them and
-    a filesystem-capable harness reads them out of
-    ``<workspace>/session-attachments/``. That difference is invisible unless
-    the chip says so, and the user needs it before sending, because it decides
-    whether the agent can open the file at all.
-
-    Two things need a real browser here. The ``accept`` attribute is what the
-    OS picker and the drag-drop ``matchesAccept`` validator read, and
-    ``set_input_files`` bypasses it, so it can only be asserted directly. And
-    the chip's label comes from ``classifyAttachment`` running against a real
-    ``File`` the input produced, not a hand-built fixture.
-    """
+    """The picker admits ZIP files and the composer shows a normal file card."""
     base_url, session_id = seeded_session
     sample = tmp_path / _ZIP_NAME
     sample.write_bytes(b"PK\x03\x04 a small but real-enough zip payload")
@@ -170,30 +150,8 @@ def test_attach_zip_is_labelled_workspace_delivered(
 
     # Accepted: the chip and its remove control exist.
     expect(page.get_by_role("button", name=f"Remove {_ZIP_NAME}")).to_be_visible(timeout=10_000)
-    # And the chip states the delivery mode.
     chip = page.get_by_text(_ZIP_NAME, exact=True).locator("xpath=..")
-    expect(chip).to_contain_text("workspace")
-
-
-def test_attach_text_file_is_not_labelled_workspace_delivered(
-    page: Page, seeded_session: tuple[str, str], tmp_path: Path
-) -> None:
-    """An inlined attachment carries no workspace label.
-
-    The negative half of the delivery-mode contract: if every chip were
-    labelled the label would tell the user nothing.
-    """
-    base_url, session_id = seeded_session
-    sample = tmp_path / _ATTACH_NAME
-    sample.write_text(_ATTACH_BODY)
-
-    page.goto(f"{base_url}/c/{session_id}")
-    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
-
-    page.locator('input[type="file"][accept*="image/"]').set_input_files(str(sample))
-
-    expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_be_visible(timeout=10_000)
-    chip = page.get_by_text(_ATTACH_NAME, exact=True).locator("xpath=..")
+    expect(chip).to_contain_text("ZIP ·")
     expect(chip).not_to_contain_text("workspace")
 
 
@@ -204,7 +162,7 @@ def test_reject_unsupported_type(
 
     Covers the validation ``addFiles`` gained (``validateAttachments`` in
     lib/attachments.ts). Office documents and archives are no longer rejected
-    here (they are delivered to the workspace instead), so this pins the shape
+    here, so this pins the shape
     that is still refused: media no harness can open from disk. Driving the
     hidden input directly (``set_input_files`` bypasses the accept filter, so
     the file reaches ``addFiles``) must yield NO chip and a visible error.

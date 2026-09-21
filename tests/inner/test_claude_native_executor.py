@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -597,7 +598,7 @@ async def test_run_turn_materializes_image_to_bridge_dir(
     )
 
     # The file was written to disk with the correct content.
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     # Exactly 1 file — the materialized PNG.
     assert len(written) == 1, (
@@ -772,20 +773,15 @@ async def test_run_turn_unresolved_file_id_emits_visible_marker(
     # The unresolved image block becomes a visible marker, not a silent drop.
     assert sent[0]["content"] == ("[Attachment file_abc123 could not be loaded]\n\nanalyze this")
     # No uploads directory created — nothing to materialize.
-    assert not (tmp_path / "uploads").exists()
+    assert not (attachment_cache_dir(tmp_path)).exists()
 
 
 @pytest.mark.asyncio
-async def test_run_turn_materializes_zip_into_workspace(
+async def test_run_turn_materializes_zip_outside_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    A zip attachment lands in the workspace, not the bridge directory.
-
-    The bridge dir is not part of the project Claude's tools operate in, so
-    a file staged there would be unreachable; the workspace is its cwd.
-    """
+    """A ZIP reaches Claude by absolute cache path without changing the checkout."""
     import json
 
     workspace = tmp_path / "repo"
@@ -822,22 +818,18 @@ async def test_run_turn_materializes_zip_into_workspace(
     ]
 
     assert events == [TurnComplete(response=None)]
-    materialized = workspace / "session-attachments" / "bundle.zip"
+    materialized = attachment_cache_dir(tmp_path) / "bundle.zip"
     assert materialized.read_bytes() == zip_bytes
-    assert not (tmp_path / "uploads").exists()
-    assert f"[Attached file: {materialized}]" in sent[0]["content"]
+    assert list(workspace.iterdir()) == []
+    assert f"[Attached: {materialized}]" in sent[0]["content"]
 
 
 @pytest.mark.asyncio
-async def test_run_turn_zip_without_workspace_emits_marker(
+async def test_run_turn_materializes_zip_without_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    With no workspace recorded at launch there is nowhere to place the file,
-    so the turn surfaces a visible marker instead of failing or silently
-    dropping the attachment.
-    """
+    """Attachment delivery works before any workspace is recorded at launch."""
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
 
@@ -864,7 +856,10 @@ async def test_run_turn_zip_without_workspace_emits_marker(
     ]
 
     assert events == [TurnComplete(response=None)]
-    assert sent[0]["content"] == "[Attachment bundle.zip could not be loaded]\n\nunpack this"
+    assert (
+        sent[0]["content"]
+        == f"[Attached: {attachment_cache_dir(tmp_path) / 'bundle.zip'}]\n\nunpack this"
+    )
 
 
 @pytest.mark.asyncio
@@ -911,7 +906,7 @@ async def test_run_turn_dedup_same_filename(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = sorted(uploads.iterdir())
     # Two distinct files, not one overwritten file.
     assert len(written) == 2, (
@@ -956,7 +951,7 @@ async def test_run_turn_image_without_filename_gets_generated_name(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     assert len(written) == 1
     # Generated name should have .png extension from the data URI MIME.
@@ -1008,7 +1003,7 @@ async def test_enqueue_session_message_materializes_image(
     assert "downscaled" not in injected
     assert (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).read_text() == resize_notice(dimensions)
     # File was written to the bridge directory.
-    written = list((tmp_path / "uploads").iterdir())
+    written = list((attachment_cache_dir(tmp_path)).iterdir())
     assert len(written) == 1
     assert written[0].name == "steering_img.png"
     assert await executor.enqueue_session_message("session-key", "follow-up")
@@ -1057,7 +1052,7 @@ async def test_run_turn_malformed_data_uri_emits_visible_marker(
     assert len(sent) == 1
     assert sent[0]["content"] == ("[Attachment attachment could not be loaded]\n\nstill send this")
     # No file written for the malformed URI.
-    assert not (tmp_path / "uploads").exists()
+    assert not (attachment_cache_dir(tmp_path)).exists()
 
 
 @pytest.mark.asyncio
@@ -1097,7 +1092,7 @@ async def test_run_turn_path_traversal_filename_sanitized(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     assert len(written) == 1
     assert written[0].name == ".bashrc"

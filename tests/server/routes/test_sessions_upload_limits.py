@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
-from omnigent.inner.native_attachments import MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
+from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
 from omnigent.runtime.content_resolver import (
     MAX_TEXT_UPLOAD_BYTES,
 )
@@ -39,7 +39,7 @@ def upload_client(db_uri: str, tmp_path) -> Iterator[tuple[TestClient, str]]:
     conv = conversation_store.create_conversation(
         title="upload session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
     )
-    # A Claude Code session, so workspace-delivered types are accepted.
+    # A Claude Code session, so filesystem types are accepted.
     conversation_store.set_labels(conv.id, CLAUDE_NATIVE_CODING_AGENT.presentation_labels)
 
     app = FastAPI()
@@ -79,7 +79,7 @@ def test_upload_small_text_file_succeeds(upload_client: tuple[TestClient, str]) 
 
 
 def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) -> None:
-    """A type that is neither inlinable nor workspace-materializable is
+    """A type that is neither inlinable nor usable with filesystem tools is
     rejected with 415, not stored."""
     client, session_id = upload_client
     resp = client.post(
@@ -101,7 +101,7 @@ def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) 
         ("app.db", "application/octet-stream"),
     ],
 )
-def test_upload_accepts_workspace_materialize_types(
+def test_upload_accepts_filesystem_types(
     upload_client: tuple[TestClient, str], filename: str, mime: str
 ) -> None:
     """Archives, office docs, and databases upload instead of 415ing, since a
@@ -115,10 +115,10 @@ def test_upload_accepts_workspace_materialize_types(
     assert resp.json()["name"] == filename
 
 
-def test_upload_rejects_workspace_types_for_a_harness_without_a_workspace(
+def test_upload_rejects_filesystem_types_for_an_unsupported_harness(
     upload_client: tuple[TestClient, str], db_uri: str
 ) -> None:
-    """Only Claude Code and Codex open workspace files. Any other harness would
+    """Only Claude Code and Codex open these file types. Any other harness would
     receive the zip inlined and drop it, so the upload is refused up front."""
     client, _ = upload_client
     sdk_session = SqlAlchemyConversationStore(db_uri).create_conversation(
@@ -149,10 +149,10 @@ def test_upload_rejects_workspace_types_for_a_harness_without_a_workspace(
         },
     ],
 )
-def test_message_cannot_inline_a_workspace_attachment(
+def test_message_cannot_inline_a_filesystem_attachment(
     upload_client: tuple[TestClient, str], block: dict[str, str]
 ) -> None:
-    """Inline bytes would reach the workspace without the upload route's checks."""
+    """Inline bytes would reach the harness without the upload route's checks."""
     client, session_id = upload_client
     resp = client.post(
         f"/v1/sessions/{session_id}/events",
@@ -176,12 +176,12 @@ def test_upload_docx_mislabeled_as_zip_is_accepted(
     assert resp.json()["name"] == "report.docx"
 
 
-def test_upload_rejects_oversized_workspace_materialize_file(
+def test_upload_rejects_oversized_filesystem_file(
     upload_client: tuple[TestClient, str],
 ) -> None:
-    """A zip over the workspace-materialize per-file cap is rejected with 413."""
+    """A zip over the filesystem per-file cap is rejected with 413."""
     client, session_id = upload_client
-    oversized = b"\x00" * (MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES + 1)
+    oversized = b"\x00" * (MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES + 1)
     resp = client.post(
         f"/v1/sessions/{session_id}/resources/files",
         files={"file": ("huge.zip", oversized, "application/zip")},
@@ -309,7 +309,7 @@ def test_upload_rejects_an_extension_the_deployment_denies(
     to deny selected MIME types or extensions" requirement is for.
     """
     monkeypatch.setattr(
-        "omnigent.server.server_config.workspace_attachment_denied_extensions",
+        "omnigent.server.server_config.filesystem_attachment_denied_extensions",
         lambda: frozenset({".zip"}),
     )
     client, session_id = upload_client
@@ -329,7 +329,7 @@ def test_upload_still_accepts_a_type_the_denylist_does_not_name(
 ) -> None:
     """The denylist narrows the allowlist precisely, not wholesale."""
     monkeypatch.setattr(
-        "omnigent.server.server_config.workspace_attachment_denied_extensions",
+        "omnigent.server.server_config.filesystem_attachment_denied_extensions",
         lambda: frozenset({".zip"}),
     )
     client, session_id = upload_client
@@ -353,7 +353,7 @@ def test_upload_rejects_once_the_session_file_quota_is_spent(
     files in the sandbox one request at a time.
     """
     monkeypatch.setattr(
-        "omnigent.server.server_config.workspace_attachment_file_limit",
+        "omnigent.server.server_config.filesystem_attachment_file_limit",
         lambda: 2,
     )
     client, session_id = upload_client
@@ -371,10 +371,10 @@ def test_upload_rejects_once_the_session_file_quota_is_spent(
     )
 
     assert resp.status_code == 413, resp.text
-    assert "workspace attachments" in resp.text
+    assert "file attachments" in resp.text
 
 
-async def test_parallel_uploads_cannot_overspend_the_workspace_quota(
+async def test_parallel_uploads_cannot_overspend_the_filesystem_quota(
     upload_client: tuple[TestClient, str],
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -387,7 +387,7 @@ async def test_parallel_uploads_cannot_overspend_the_workspace_quota(
     from omnigent.server.routes.sessions import routes_resources
 
     monkeypatch.setattr(
-        "omnigent.server.server_config.workspace_attachment_file_limit",
+        "omnigent.server.server_config.filesystem_attachment_file_limit",
         lambda: 1,
     )
     real_read = routes_resources._read_upload_capped
@@ -418,7 +418,7 @@ async def test_parallel_uploads_cannot_overspend_the_workspace_quota(
     ]
 
 
-def test_inlined_attachments_do_not_spend_the_workspace_quota(
+def test_inlined_attachments_do_not_spend_the_filesystem_quota(
     upload_client: tuple[TestClient, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -427,7 +427,7 @@ def test_inlined_attachments_do_not_spend_the_workspace_quota(
     count against a quota that exists to bound sandbox disk use.
     """
     monkeypatch.setattr(
-        "omnigent.server.server_config.workspace_attachment_file_limit",
+        "omnigent.server.server_config.filesystem_attachment_file_limit",
         lambda: 1,
     )
     client, session_id = upload_client
@@ -447,19 +447,19 @@ def test_inlined_attachments_do_not_spend_the_workspace_quota(
     assert resp.status_code in (200, 201), resp.text
 
 
-def test_declared_text_mime_cannot_skip_the_workspace_policy(
+def test_declared_text_mime_cannot_skip_the_filesystem_policy(
     upload_client: tuple[TestClient, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A zip sent as ``text/plain`` still goes through the workspace checks.
+    A zip sent as ``text/plain`` still goes through the upload checks.
 
     Delivery follows the filename, so trusting the declared MIME would store
     the archive as inline text, skip the denylist and quota, and still have
-    the executor write it into the workspace.
+    the executor write it to the cache.
     """
     monkeypatch.setattr(
-        "omnigent.server.server_config.workspace_attachment_denied_extensions",
+        "omnigent.server.server_config.filesystem_attachment_denied_extensions",
         lambda: frozenset({".zip"}),
     )
     client, session_id = upload_client
@@ -473,13 +473,13 @@ def test_declared_text_mime_cannot_skip_the_workspace_policy(
     assert "not accepted by this deployment" in resp.text
 
 
-def test_quota_counts_workspace_files_past_any_page_boundary(
+def test_quota_counts_filesystem_files_past_any_page_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Workspace files are counted however many inline files precede them.
+    These file types are counted however many inline files precede them.
 
-    Stopping after a fixed number of pages let a session bury workspace
+    Stopping after a fixed number of pages let a session bury filesystem
     uploads behind enough inline ones and exceed its configured limit. The
     fake store serves one record per page so the zip sits past the point where
     the old 20-page scan stopped.
@@ -488,7 +488,7 @@ def test_quota_counts_workspace_files_past_any_page_boundary(
 
     from omnigent.entities import StoredFile
     from omnigent.entities.pagination import PagedList
-    from omnigent.server.routes._sessions.helpers import _enforce_workspace_attachment_policy
+    from omnigent.server.routes._sessions.helpers import _enforce_filesystem_attachment_policy
 
     records = [
         StoredFile(id=f"f{i:03d}", created_at=i, filename=f"n{i}.txt", bytes=2) for i in range(30)
@@ -509,12 +509,12 @@ def test_quota_counts_workspace_files_past_any_page_boundary(
             )
 
     monkeypatch.setattr(
-        "omnigent.server.server_config.workspace_attachment_file_limit",
+        "omnigent.server.server_config.filesystem_attachment_file_limit",
         lambda: 1,
     )
 
     with pytest.raises(HTTPException) as exc:
-        _enforce_workspace_attachment_policy(
+        _enforce_filesystem_attachment_policy(
             ["two.zip"],
             session_id="conv_1",
             file_store=_OnePerPageStore(),  # type: ignore[arg-type]

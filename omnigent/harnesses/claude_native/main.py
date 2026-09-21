@@ -5243,7 +5243,7 @@ async def _resolve_cold_resume_args(
         ) from exc
     labels = payload.get("labels") if isinstance(payload, dict) else None
     wrapper = labels.get(_WRAPPER_LABEL_KEY) if isinstance(labels, dict) else None
-    if wrapper != _WRAPPER_LABEL_VALUE:
+    if not isinstance(labels, dict) or wrapper != _WRAPPER_LABEL_VALUE:
         raise click.ClickException(
             f"Conversation {session_id!r} is not a claude-native session "
             f"(wrapper={wrapper!r}). Use `{cli_invocation()} run --resume "
@@ -5266,6 +5266,7 @@ async def _resolve_cold_resume_args(
         session_id=session_id,
         external_session_id=external_session_id,
         workspace=Path.cwd().resolve(),
+        bridge_dir=bridge_dir_for_bridge_id(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
     )
     if transcript is None:
         # No resumable records: ``claude --resume`` against an empty (or
@@ -5287,6 +5288,7 @@ async def _ensure_local_claude_resume_transcript(
     session_id: str,
     external_session_id: str,
     workspace: Path,
+    bridge_dir: Path | None = None,
 ) -> Path | None:
     """
     Refresh Claude Code's local JSONL transcript for cold resume.
@@ -5311,6 +5313,8 @@ async def _ensure_local_claude_resume_transcript(
         ``OMNIGENT_RUNNER_WORKSPACE``. Pass an already-resolved
         path (symlinks collapsed) so the project-dir encoding matches
         what Claude computes.
+    :param bridge_dir: Launch bridge path identifying the attachment cache.
+        Defaults to the legacy session-id bridge when omitted.
     :returns: Path to the local transcript that was written; ``None`` if
         *external_session_id* is not a safe transcript stem, or if the AP
         history yields no resumable records (an empty transcript would make
@@ -5357,7 +5361,7 @@ async def _ensure_local_claude_resume_transcript(
         session_id=session_id,
         external_session_id=external_session_id,
         cwd=current,
-        bridge_dir=bridge_dir_for_conversation_id(session_id),
+        bridge_dir=bridge_dir or bridge_dir_for_conversation_id(session_id),
     )
     # Empty transcript → ``claude --resume`` exits fatally ("No conversation
     # found"), killing the terminal-as-agent. Return None so the caller
@@ -5537,8 +5541,7 @@ def _claude_transcript_records_from_session_items(
         ``"02857840-6362-408f-b41f-309e396ed7c6"``.
     :param cwd: Working directory to write into each transcript
         record, e.g. ``Path("/home/me/repo")``.
-    :param bridge_dir: Session bridge directory; resolved attachment
-        blocks are re-materialized under its ``uploads/`` subdirectory.
+    :param bridge_dir: Launch bridge path identifying the attachment cache.
     :returns: Claude JSONL record dictionaries.
     """
     records: list[_JsonObject] = []
@@ -5687,9 +5690,7 @@ def _claude_transcript_record_from_session_item(
     if item_type == "message":
         role = item.get("role")
         if role == "user":
-            user_content = _claude_user_content_from_api_blocks(
-                item.get("content"), bridge_dir, cwd
-            )
+            user_content = _claude_user_content_from_api_blocks(item.get("content"), bridge_dir)
             if user_content is None and allow_native_message_content:
                 user_content = _claude_native_message_content(item.get("content"), role="user")
             if user_content is None:
@@ -5868,14 +5869,13 @@ def _synthetic_claude_transcript_uuid(
 def _claude_user_content_from_api_blocks(
     content: object,
     bridge_dir: Path,
-    workspace: Path,
 ) -> str | list[_JsonObject] | None:
     """
     Convert Omnigent user message blocks into Claude message content.
 
     Attachment blocks (``input_image`` / ``input_file``) cannot ride the
-    transcript as bytes; resolved ones are re-materialized under the
-    bridge dir and referenced by an ``[Attached: <path>]`` line, and
+    transcript as bytes; resolved ones are re-materialized in the
+    session attachment cache and referenced by an ``[Attached: <path>]`` line, and
     unresolved ones surface as a visible could-not-load marker — never a
     silent drop.
 
@@ -5885,12 +5885,10 @@ def _claude_user_content_from_api_blocks(
         ``[{"type": "input_text", "text": "hello"}]``.
     :param bridge_dir: Session bridge directory for re-materializing
         attachment blocks.
-    :param workspace: Directory Claude will run in, for attachment types
-        delivered by materializing them there.
     :returns: A string for simple text prompts, a Claude content block
         list for multi-block prompts, or ``None`` when no text exists.
     """
-    blocks = _claude_attachment_text_blocks_from_api_content(content, bridge_dir, workspace)
+    blocks = _claude_attachment_text_blocks_from_api_content(content, bridge_dir)
     blocks += _claude_text_blocks_from_api_content(content, api_type="input_text")
     if not blocks:
         return None
@@ -5903,26 +5901,19 @@ def _claude_user_content_from_api_blocks(
 def _claude_attachment_text_blocks_from_api_content(
     content: object,
     bridge_dir: Path,
-    workspace: Path,
 ) -> list[_JsonObject]:
     """
     Re-materialize attachment blocks as transcript text references.
 
-    Routes each block exactly as a live turn does, so a resume after runner
-    replacement reaches the same file: inlinable types are decoded to
-    ``<bridge_dir>/uploads/``, archives and other workspace-delivered types
-    into *workspace*. The caller supplies that path because a rebuild runs
-    before the bridge config for the replacement launch exists. A block whose
-    bytes never arrived yields the could-not-load placeholder instead of
-    vanishing from the rebuilt transcript.
+    Uses the same session attachment cache as live turns. Missing bytes yield
+    a visible could-not-load placeholder instead of disappearing from history.
 
     :param content: Omnigent content array, e.g.
         ``[{"type": "input_image", "image_url": "data:image/png;..."}]``.
-    :param bridge_dir: Session bridge directory to write files under.
-    :param workspace: Directory Claude will run in.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: Claude ``{"type": "text", "text": ...}`` blocks.
     """
-    from omnigent.inner.native_attachments import routed_attachment_reference_line
+    from omnigent.inner.native_attachments import attachment_reference_line
 
     if not isinstance(content, list):
         return []
@@ -5931,7 +5922,7 @@ def _claude_attachment_text_blocks_from_api_content(
         block = _json_object(value)
         if block is None or block.get("type") not in ("input_image", "input_file"):
             continue
-        line = routed_attachment_reference_line(block, bridge_dir, workspace)
+        line = attachment_reference_line(block, bridge_dir)
         blocks.append({"type": "text", "text": line})
     return blocks
 

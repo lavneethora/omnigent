@@ -671,7 +671,7 @@ def test_deleted_file_raises_clear_error(
 
 
 def test_workspace_materialize_file_rejected_by_generic_resolver() -> None:
-    """A generic (non-native) model can't be handed a workspace-materialize
+    """A generic (non-native) model can't be handed a filesystem
     type: it would either fail provider-side or garble as text, so the
     resolver must raise a clear, actionable error instead of inlining it."""
     zip_store = FakeFileStore(
@@ -698,7 +698,7 @@ def test_workspace_materialize_file_rejected_by_generic_resolver() -> None:
 
 
 def test_native_forward_defers_workspace_files_and_resolves_the_rest() -> None:
-    """The native runner fetches workspace files itself, so forwarding leaves
+    """The native runner fetches filesystem attachments itself, so forwarding leaves
     them as file_id references rather than failing the whole message."""
     from omnigent.runtime.content_resolver import _resolve_message_content
 
@@ -727,7 +727,7 @@ def test_native_forward_defers_workspace_files_and_resolves_the_rest() -> None:
         content,
         store,
         FakeArtifactStore(blobs={"file_txt": b"hello"}),  # type: ignore[arg-type]
-        defer_workspace_files=True,
+        defer_filesystem_files=True,
     )
 
     assert resolved[0] == zip_block
@@ -1748,9 +1748,9 @@ def test_extracts_text_from_csv_attachment() -> None:
     assert "4111 1111 1111 1111" in out[0]["text"]
 
 
-def test_workspace_attachment_is_announced_to_policy_without_text() -> None:
+def test_archive_is_announced_to_policy_without_text() -> None:
     """
-    A workspace-delivered file is listed for policy, with no text.
+    An archive is listed for policy, with no decoded text.
 
     Its bytes are not scannable, but the file does land on the agent's
     filesystem, so a policy needs to see that it was attached and be able to
@@ -1765,44 +1765,34 @@ def test_workspace_attachment_is_announced_to_policy_without_text() -> None:
 
     out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
 
-    assert len(out) == 1
-    assert out[0]["filename"] == "bundle.zip"
-    assert out[0]["delivery"] == "workspace"
-    assert out[0]["text"] == ""
+    assert out == [{"filename": "bundle.zip", "content_type": "application/zip", "text": ""}]
 
 
-def test_inlined_attachment_is_marked_as_inline_delivery() -> None:
-    """Inline entries say so, so a policy can tell the two apart."""
+def test_text_attachment_policy_metadata_includes_decoded_content() -> None:
+    """Policy sees the text independently of how a harness consumes the file."""
     fs, arts = _stores_with("file_csv", "data.csv", "text/csv", b"a,b\n1,2\n")
     content = [{"type": "input_file", "file_id": "file_csv"}]
 
     out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
 
-    assert len(out) == 1
-    assert out[0]["delivery"] == "inline"
+    assert out == [{"filename": "data.csv", "content_type": "text/csv", "text": "a,b\n1,2\n"}]
 
 
-def test_archive_stored_under_a_text_mime_is_announced_as_workspace() -> None:
+def test_archive_stored_under_a_text_mime_is_announced_without_decoding() -> None:
     """
-    An archive stored as ``text/plain`` is still announced as workspace delivery.
-
-    Delivery follows the filename, so the file reaches the agent's filesystem
-    either way. Classifying it by MIME would decode the archive as inline text
-    and hide from policy that a binary was written to disk.
+    A misleading text MIME must not cause archive bytes to be decoded as text.
     """
     fs, arts = _stores_with("file_zip", "bundle.zip", "text/plain", b"PK\x03\x04data")
     content = [{"type": "input_file", "file_id": "file_zip"}]
 
     out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
 
-    assert len(out) == 1
-    assert out[0]["delivery"] == "workspace"
-    assert out[0]["text"] == ""
+    assert out == [{"filename": "bundle.zip", "content_type": "text/plain", "text": ""}]
 
 
-def test_workspace_attachment_sent_as_an_image_is_still_announced() -> None:
+def test_filesystem_attachment_sent_as_an_image_is_still_announced() -> None:
     """
-    A workspace file a client sent as an image block is announced too.
+    A filesystem attachment a client sent as an image block is announced too.
 
     An archive uploaded under an image MIME comes back as an ``input_image``
     block, and delivery follows the stored filename, so it reaches the
@@ -1813,13 +1803,11 @@ def test_workspace_attachment_sent_as_an_image_is_still_announced() -> None:
 
     out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
 
-    assert len(out) == 1
-    assert out[0]["filename"] == "bundle.zip"
-    assert out[0]["delivery"] == "workspace"
+    assert out == [{"filename": "bundle.zip", "content_type": "image/png", "text": ""}]
 
 
 def test_an_image_attachment_is_not_announced_to_policy() -> None:
-    """Images carry no scannable text and never reach the filesystem."""
+    """Images are outside the text attachment scanner's scope."""
     fs, arts = _stores_with("file_png", "shot.png", "image/png", b"\x89PNG data")
     content = [{"type": "input_image", "file_id": "file_png"}]
 

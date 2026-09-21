@@ -10645,11 +10645,11 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-# Page size for walking a session's files when totalling its workspace attachments.
-_WORKSPACE_QUOTA_PAGE_SIZE = 100
+# Page size for walking a session's files when totalling its filesystem attachments.
+_FILESYSTEM_QUOTA_PAGE_SIZE = 100
 
 
-def _enforce_workspace_attachment_policy(
+def _enforce_filesystem_attachment_policy(
     filenames: Sequence[str],
     *,
     session_id: str,
@@ -10657,12 +10657,12 @@ def _enforce_workspace_attachment_policy(
     sizes: Sequence[int] | None = None,
 ) -> int:
     """
-    Apply deployment policy to workspace-materialized files entering a session.
+    Apply deployment policy to files requiring filesystem tools entering a session.
 
     Enforces the operator denylist and the per-session file-count and total-byte
     quotas before any bytes are read, so a rejected upload or copy never
-    buffers. This is the only quota gate: the runner can't enforce one, because
-    a workspace is shared by many sessions.
+    buffers. The server accounts for all stored uploads, including files that
+    are not currently present in the runner cache.
 
     :param filenames: The incoming files' names, e.g. ``["bundle.zip"]``.
     :param session_id: Destination session, whose existing attachments are counted.
@@ -10674,15 +10674,15 @@ def _enforce_workspace_attachment_policy(
     :raises HTTPException: 415 when an extension is denied by configuration,
         or 413 when the files would exceed a per-file or per-session quota.
     """
-    from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+    from omnigent.inner.native_attachments import requires_filesystem
     from omnigent.server.server_config import (
-        workspace_attachment_denied_extensions,
-        workspace_attachment_file_limit,
-        workspace_attachment_total_bytes_limit,
-        workspace_attachment_upload_limit,
+        filesystem_attachment_denied_extensions,
+        filesystem_attachment_file_limit,
+        filesystem_attachment_total_bytes_limit,
+        filesystem_attachment_upload_limit,
     )
 
-    denied = workspace_attachment_denied_extensions()
+    denied = filesystem_attachment_denied_extensions()
     for filename in filenames:
         suffix = PurePath(filename).suffix.lower()
         if suffix in denied:
@@ -10691,27 +10691,26 @@ def _enforce_workspace_attachment_policy(
                 detail=f"Attachments of type '{suffix}' are not accepted by this deployment.",
             )
 
-    max_files = workspace_attachment_file_limit()
-    max_total_bytes = workspace_attachment_total_bytes_limit()
-    per_file = workspace_attachment_upload_limit()
+    max_files = filesystem_attachment_file_limit()
+    max_total_bytes = filesystem_attachment_total_bytes_limit()
+    per_file = filesystem_attachment_upload_limit()
 
     used_files = 0
     used_bytes = 0
     after: str | None = None
     # Walk every page: stopping at a fixed page count would let a session hide
-    # workspace files behind enough inline ones. The walk ends early once the
+    # filesystem attachments behind enough inline ones. The walk ends early once the
     # quota is already exhausted, since the answer can't change after that.
     while used_files + len(filenames) <= max_files and used_bytes < max_total_bytes:
         page = file_store.list(
             session_id=session_id,
-            limit=_WORKSPACE_QUOTA_PAGE_SIZE,
+            limit=_FILESYSTEM_QUOTA_PAGE_SIZE,
             after=after,
             order="asc",
         )
         for stored in page.data:
-            # Count only the workspace-delivered files: inlined attachments
-            # never reach the sandbox filesystem and so spend none of this quota.
-            if workspace_materialize_upload_limit(stored.filename) is not None:
+            # This quota covers the types that require filesystem tools.
+            if requires_filesystem(stored.filename):
                 used_files += 1
                 used_bytes += stored.bytes
         if not page.has_more or page.last_id is None:
@@ -10722,7 +10721,7 @@ def _enforce_workspace_attachment_policy(
         raise HTTPException(
             status_code=413,
             detail=(
-                f"This session already holds {used_files} workspace attachments "
+                f"This session already holds {used_files} file attachments "
                 f"(limit {max_files}). Remove one before attaching another."
             ),
         )
@@ -10731,7 +10730,7 @@ def _enforce_workspace_attachment_policy(
         raise HTTPException(
             status_code=413,
             detail=(
-                f"This session's workspace attachments would exceed the "
+                f"This session's file attachments would exceed the "
                 f"{max_total_bytes // (1024 * 1024)} MB limit "
                 f"({used_bytes // (1024 * 1024)} MB already used)."
             ),
@@ -10739,7 +10738,7 @@ def _enforce_workspace_attachment_policy(
     if sizes is not None and any(size > per_file for size in sizes):
         raise HTTPException(
             status_code=413,
-            detail=(f"Workspace attachments are limited to {per_file // (1024 * 1024)} MB each."),
+            detail=(f"File attachments are limited to {per_file // (1024 * 1024)} MB each."),
         )
 
     # Cap an upload at whichever is smaller: the per-file limit, or the

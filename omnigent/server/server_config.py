@@ -200,60 +200,60 @@ def image_compression_concurrency() -> int:
     return _config_positive_int("image_compression_concurrency", MAX_IMAGE_COMPRESSION_CONCURRENCY)
 
 
-def workspace_attachment_upload_limit() -> int:
-    """Max byte size of a single workspace-materialized attachment.
+def filesystem_attachment_upload_limit() -> int:
+    """Max byte size of a single filesystem attachment.
 
-    Config key ``workspace_attachment_max_bytes``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES`.
+    Config key ``filesystem_attachment_max_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES`.
     """
-    from omnigent.inner.native_attachments import MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
+    from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
 
     return _config_positive_int(
-        "workspace_attachment_max_bytes", MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
+        "filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
     )
 
 
-def workspace_attachment_file_limit() -> int:
-    """Max number of workspace-materialized attachments one session may hold.
+def filesystem_attachment_file_limit() -> int:
+    """Max number of filesystem attachments one session may hold.
 
-    Config key ``workspace_attachment_max_files``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_SESSION_WORKSPACE_ATTACHMENTS`.
+    Config key ``filesystem_attachment_max_files``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENTS`.
     """
-    from omnigent.inner.native_attachments import MAX_SESSION_WORKSPACE_ATTACHMENTS
+    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENTS
 
     return _config_positive_int(
-        "workspace_attachment_max_files", MAX_SESSION_WORKSPACE_ATTACHMENTS
+        "filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS
     )
 
 
-def workspace_attachment_total_bytes_limit() -> int:
-    """Max summed bytes of workspace-materialized attachments per session.
+def filesystem_attachment_total_bytes_limit() -> int:
+    """Max summed bytes of filesystem attachments per session.
 
-    Config key ``workspace_attachment_max_total_bytes``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES`.
+    Config key ``filesystem_attachment_max_total_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES`.
     """
-    from omnigent.inner.native_attachments import MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES
+    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
 
     return _config_positive_int(
-        "workspace_attachment_max_total_bytes", MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES
+        "filesystem_attachment_max_total_bytes", MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
     )
 
 
-def workspace_attachment_denied_extensions() -> frozenset[str]:
+def filesystem_attachment_denied_extensions() -> frozenset[str]:
     """Extensions a deployment refuses to materialize, beyond the allowlist.
 
-    Config key ``workspace_attachment_denied_extensions``, a list of
+    Config key ``filesystem_attachment_denied_extensions``, a list of
     extensions with or without the leading dot (``[".zip", "docx"]``).
     Lets an operator narrow the built-in allowlist (e.g. deny archives
     while still accepting office documents) without a code change.
     Unparseable entries are skipped rather than failing the upload path.
     """
-    raw = load_server_config().get("workspace_attachment_denied_extensions")
+    raw = load_server_config().get("filesystem_attachment_denied_extensions")
     if raw is None:
         return frozenset()
     if not isinstance(raw, list):
         logger.warning(
-            "server config workspace_attachment_denied_extensions=%r is not a list, ignoring",
+            "server config filesystem_attachment_denied_extensions=%r is not a list, ignoring",
             raw,
         )
         return frozenset()
@@ -261,7 +261,7 @@ def workspace_attachment_denied_extensions() -> frozenset[str]:
     for entry in raw:
         if not isinstance(entry, str) or not entry.strip():
             logger.warning(
-                "server config workspace_attachment_denied_extensions entry %r is not a "
+                "server config filesystem_attachment_denied_extensions entry %r is not a "
                 "non-empty string, skipping",
                 entry,
             )

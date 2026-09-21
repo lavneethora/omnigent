@@ -2349,7 +2349,7 @@ async def test_copy_spends_the_child_workspace_quota(
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 
     monkeypatch.setattr(
-        "omnigent.server.server_config.workspace_attachment_file_limit",
+        "omnigent.server.server_config.filesystem_attachment_file_limit",
         lambda: 1,
     )
     file_conv_store._conversations["405bfe154d5c0e795a2b87021bc897bf"].labels.update(
