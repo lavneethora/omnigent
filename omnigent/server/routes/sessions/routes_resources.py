@@ -81,13 +81,13 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client_for_resource_access,
     _if_none_match_matches,
     _load_agent_spec_for_session,
-    _native_coding_agent_for_session,
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
     _raise_if_runner_session_agent_missing,
     _raise_if_session_agent_missing_payload,
     _read_upload_capped,
+    _require_filesystem_attachment_harness,
     _stored_file_to_resource,
     require_filesystem_attachment_runtime,
 )
@@ -162,29 +162,6 @@ def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _attachment_upload_locks[session_id] = lock
     return lock
-
-
-async def _require_filesystem_attachment_harness(conv: Conversation, filename: str) -> None:
-    """
-    Refuse a file requiring filesystem tools if the harness cannot open it.
-
-    Claude Code and Codex support uploads and history restoration for these formats.
-
-    :param conv: Destination session.
-    :param filename: The attached file, named in the error.
-    :raises HTTPException: 415 when the session's harness cannot open the file.
-    """
-    from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
-
-    native = await asyncio.to_thread(_native_coding_agent_for_session, conv)
-    if native is None or native.harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
-        raise HTTPException(
-            status_code=415,
-            detail=(
-                f"'{filename}' can only be attached to a Claude Code or Codex "
-                "session, which can open this file type."
-            ),
-        )
 
 
 def register_resources_routes(

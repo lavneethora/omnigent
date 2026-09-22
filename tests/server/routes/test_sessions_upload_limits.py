@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -174,6 +175,85 @@ def test_message_cannot_inline_a_filesystem_attachment(
     )
     assert resp.status_code == 400, resp.text
     assert "payload.zip" in resp.text
+
+
+@pytest.mark.parametrize("transition", ["switch-agent", "fork"])
+@pytest.mark.parametrize(
+    "filename,target_harness,event_type,block_type,status",
+    [
+        ("archive.zip", "cursor-native", "message", "input_file", 415),
+        ("archive.zip", "openai-agents", "message", "input_file", 415),
+        ("archive.zip", "openai-agents", "message", "input_image", 415),
+        ("archive.zip", "cursor-native", "slash_command", "input_file", 415),
+        ("archive.zip", "claude-native", "message", "input_file", 202),
+        ("archive.zip", "codex-native", "message", "input_file", 202),
+        ("notes.txt", "openai-agents", "message", "input_file", 202),
+    ],
+)
+def test_send_rechecks_unsent_upload_after_harness_transition(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+    filename: str,
+    target_harness: str,
+    event_type: str,
+    block_type: str,
+    status: int,
+) -> None:
+    """Stored filenames govern admission before policy, persistence, or runner dispatch."""
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+
+    client, source_id = upload_client
+    uploaded = _upload(client, source_id, filename)
+    assert uploaded.status_code == 201, uploaded.text
+    target = SqlAlchemyAgentStore(db_uri).create("c" * 32, "target", "target/bundle")
+
+    def load(_agent_id: str, bundle_location: str, **_kwargs: object) -> SimpleNamespace:
+        harness = target_harness if bundle_location == target.bundle_location else "claude-native"
+        return SimpleNamespace(
+            spec=SimpleNamespace(executor=SimpleNamespace(harness_kind=harness))
+        )
+
+    monkeypatch.setattr(sessions, "get_agent_cache", lambda: SimpleNamespace(load=load))
+    changed = client.post(f"/v1/sessions/{source_id}/{transition}", json={"agent_id": target.id})
+    assert changed.status_code == (201 if transition == "fork" else 200), changed.text
+    session_id = changed.json()["id"]
+    files = SqlAlchemyFileStore(db_uri).list(session_id).data
+    assert len(files) == 1
+    assert files[0].filename == filename
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = conversations.list_items(session_id).data
+
+    # Stop admitted inputs at policy so the test never needs a live runner.
+    policy = AsyncMock(return_value={"verdict": "deny", "reason": "test policy"})
+    dispatch = AsyncMock()
+    monkeypatch.setattr(routes_events, "_evaluate_input_policy", policy)
+    monkeypatch.setattr(routes_events, "_persist_policy_deny_sentinel", AsyncMock())
+    monkeypatch.setattr(routes_events, "_dispatch_session_event_to_runner", dispatch)
+    response = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": event_type,
+            "data": {
+                "role": "user",
+                "content": [
+                    {"type": block_type, "file_id": files[0].id, "filename": "renamed.txt"}
+                ],
+            },
+        },
+    )
+    assert response.status_code == status, response.text
+    if status == 415:
+        assert filename in response.text
+        assert "Claude Code or Codex" in response.text
+        policy.assert_not_awaited()
+    else:
+        assert response.json()["denied"] is True
+        policy.assert_awaited_once()
+    dispatch.assert_not_awaited()
+    assert conversations.list_items(session_id).data == before
 
 
 def test_upload_rejects_oversized_filesystem_file(

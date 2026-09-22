@@ -10810,6 +10810,26 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
 _FILESYSTEM_QUOTA_PAGE_SIZE = 100
 
 
+async def _require_filesystem_attachment_harness(conv: Conversation, filename: str) -> None:
+    """Require a harness supporting delivery and restoration of filesystem attachments.
+
+    :param conv: Destination session.
+    :param filename: The attached file, named in the error.
+    :raises HTTPException: 415 when the session's harness cannot open the file.
+    """
+    from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
+
+    native = await asyncio.to_thread(_native_coding_agent_for_session, conv)
+    if native is None or native.harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"'{filename}' can only be attached to a Claude Code or Codex "
+                "session, which can open this file type."
+            ),
+        )
+
+
 def require_filesystem_attachment_runtime(
     *,
     host_id: str | None,
@@ -11436,6 +11456,7 @@ __all__ = [
     "_require_cost_control_label_authority",
     "_require_declared_subagent",
     "_require_external_status_forward",
+    "_require_filesystem_attachment_harness",
     "_require_host_conn_for_worktree",
     "_require_permission_mode_forward",
     "_reset_runner_resources_after_switch",
