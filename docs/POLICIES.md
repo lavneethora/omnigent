@@ -69,7 +69,7 @@ After starting, you can also add or remove policies at runtime through the REST 
 
 ### Attachment admission controls
 
-The upload and copy routes apply additional server settings to `.zip`, `.docx`,
+The upload, copy, and fork routes apply additional server settings to `.zip`, `.docx`,
 `.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These formats require
 Claude Code or Codex and an updated execution host/runner that supports their
 delivery and restoration. They are stored without extraction; the harness

@@ -687,3 +687,52 @@ def test_upload_wakes_a_sleeping_runtime_before_checking_support(
     )
     assert response.status_code == 201, response.text
     ensure.assert_awaited_once()
+
+
+@pytest.mark.parametrize("partial_write", [False, True])
+@pytest.mark.parametrize("filename", ["archive.zip", "notes.txt"])
+def test_failed_upload_releases_quota_and_can_retry(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    partial_write: bool,
+    filename: str,
+) -> None:
+    """Blob failures leave no metadata, partial bytes, or resource event behind."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_file_limit", lambda: 1
+    )
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_total_bytes_limit", lambda: 4
+    )
+    client, session_id = upload_client
+    original_put = LocalArtifactStore.put
+    attempted_ids: list[str] = []
+
+    def fail_put(store: LocalArtifactStore, key: str, data: bytes) -> None:
+        attempted_ids.append(key)
+        if partial_write:
+            original_put(store, key, data[:1])
+        raise OSError("test storage write failure")
+
+    url = f"/v1/sessions/{session_id}/resources/files"
+    upload = {"file": (filename, b"data", "application/octet-stream")}
+    with monkeypatch.context() as storage_failure:
+        storage_failure.setattr(LocalArtifactStore, "put", fail_put)
+        failed = client.post(url, files=upload)
+    assert failed.status_code == 500, failed.text
+    assert "Failed to upload file" in failed.text
+    assert len(attempted_ids) == 1
+    assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    assert not artifacts.exists(attempted_ids[0])
+    conversations = SqlAlchemyConversationStore(db_uri)
+    assert conversations.list_items(session_id, type="resource_event").data == []
+
+    retried = client.post(url, files=upload)
+    assert retried.status_code == 201, retried.text
+    assert artifacts.get(retried.json()["id"]) == b"data"
+    files = SqlAlchemyFileStore(db_uri).list(session_id).data
+    assert [stored.id for stored in files] == [retried.json()["id"]]
+    assert len(conversations.list_items(session_id, type="resource_event").data) == 1

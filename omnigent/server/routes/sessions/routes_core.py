@@ -126,6 +126,7 @@ from omnigent.server.routes._sessions.helpers import (
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
     _discovery_key,
+    _enforce_filesystem_attachment_policy,
     _filesystem_attachment_in_history,
     _forward_session_change_to_runner,
     _get_runner_client,
@@ -3233,6 +3234,20 @@ def register_core_routes(
                 if not files_page.has_more or not files_page.data:
                     break
                 files_after = files_page.last_id
+
+            from omnigent.inner.native_attachments import requires_filesystem
+
+            filesystem_sources = [
+                stored for stored in fork_source_files if requires_filesystem(stored.filename)
+            ]
+            if filesystem_sources:
+                await asyncio.to_thread(
+                    _enforce_filesystem_attachment_policy,
+                    [stored.filename or "" for stored in filesystem_sources],
+                    session_id=None,
+                    file_store=file_store,
+                    sizes=[stored.bytes for stored in filesystem_sources],
+                )
 
         try:
             new_conv = await asyncio.to_thread(

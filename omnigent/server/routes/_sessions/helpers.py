@@ -10759,7 +10759,7 @@ def require_filesystem_attachment_runtime(
 def _enforce_filesystem_attachment_policy(
     filenames: Sequence[str],
     *,
-    session_id: str,
+    session_id: str | None,
     file_store: FileStore,
     sizes: Sequence[int] | None = None,
 ) -> int:
@@ -10772,7 +10772,8 @@ def _enforce_filesystem_attachment_policy(
     are not currently present in the runner cache.
 
     :param filenames: The incoming files' names, e.g. ``["bundle.zip"]``.
-    :param session_id: Destination session, whose existing attachments are counted.
+    :param session_id: Destination session, whose existing attachments are counted,
+        or ``None`` for a new, empty destination.
     :param file_store: Store used to total the session's current usage.
     :param sizes: The incoming files' byte sizes when already known (a copy),
         checked against the per-file and remaining-session limits. ``None``
@@ -10808,7 +10809,11 @@ def _enforce_filesystem_attachment_policy(
     # Walk every page: stopping at a fixed page count would let a session hide
     # filesystem attachments behind enough inline ones. The walk ends early once the
     # quota is already exhausted, since the answer can't change after that.
-    while used_files + len(filenames) <= max_files and used_bytes < max_total_bytes:
+    while (
+        session_id is not None
+        and used_files + len(filenames) <= max_files
+        and used_bytes < max_total_bytes
+    ):
         page = file_store.list(
             session_id=session_id,
             limit=_FILESYSTEM_QUOTA_PAGE_SIZE,

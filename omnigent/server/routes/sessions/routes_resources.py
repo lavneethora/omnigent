@@ -1755,7 +1755,32 @@ def register_resources_routes(
                     {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
                 ),
             )
-            artifact_store.put(stored.id, content)
+            try:
+                artifact_store.put(stored.id, content)
+            except Exception as exc:
+                # Release quota before another upload can acquire the session lock.
+                try:
+                    file_store.delete(stored.id, session_id=session_id)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete uploaded file row during rollback: session=%s file_id=%s",
+                        session_id,
+                        stored.id,
+                        exc_info=True,
+                    )
+                try:
+                    artifact_store.delete(stored.id)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete uploaded file blob during rollback: session=%s file_id=%s",
+                        session_id,
+                        stored.id,
+                        exc_info=True,
+                    )
+                raise OmnigentError(
+                    "Failed to upload file. Please try again.",
+                    code=ErrorCode.INTERNAL_ERROR,
+                ) from exc
         resource = _stored_file_to_resource(session_id, stored)
         _publish_and_persist_resource_event(
             session_id,
