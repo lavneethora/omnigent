@@ -1025,6 +1025,7 @@ def test_remote_resume_omits_app_server_permission_config(
     overrides = (
         'approval_policy="never"',
         'sandbox_mode="danger-full-access"',
+        "sandbox_workspace_write.network_access=false",
         'model_provider="test-provider"',
     )
     assert codex_native_app_server.build_codex_remote_args(
@@ -1044,6 +1045,184 @@ def test_remote_resume_omits_app_server_permission_config(
         "ws://127.0.0.1:9876",
         "thread_test",
     ]
+
+
+@pytest.mark.parametrize("config_flag", ["-c", "--config", "-c=", "--config="])
+@pytest.mark.parametrize(
+    ("assignment", "expected_config"),
+    [
+        (
+            "sandbox_workspace_write.network_access=false",
+            {"sandbox_workspace_write.network_access": False},
+        ),
+        (
+            'sandbox_workspace_write.writable_roots=["/tmp/test-workspace"]',
+            {"sandbox_workspace_write.writable_roots": ["/tmp/test-workspace"]},
+        ),
+        (
+            "sandbox_workspace_write={network_access=false, exclude_tmpdir_env_var=true}",
+            {"sandbox_workspace_write": {"network_access": False, "exclude_tmpdir_env_var": True}},
+        ),
+        ("network.enabled=false", {"network.enabled": False}),
+        (
+            "permissions.restricted.network.enabled=false",
+            {"permissions.restricted.network.enabled": False},
+        ),
+        (
+            "network.proxy_url=http://127.0.0.1:8080",
+            {"network.proxy_url": "http://127.0.0.1:8080"},
+        ),
+        (
+            "permissions={restricted={network={enabled=false}}}",
+            {"permissions": {"restricted": {"network": {"enabled": False}}}},
+        ),
+        ("network.enabled=not-a-boolean", {"network.enabled": "not-a-boolean"}),
+        (
+            "network.proxy_url= 'http://127.0.0.1:8080 ",
+            {"network.proxy_url": "http://127.0.0.1:8080"},
+        ),
+        (
+            "sandbox_workspace_write.writable_roots=[",
+            {"sandbox_workspace_write.writable_roots": "["},
+        ),
+        (
+            "sandbox_workspace_write={network_access=false,network_access=true}",
+            {"sandbox_workspace_write": "{network_access=false,network_access=true}"},
+        ),
+        (
+            "network.proxy_url= \"'http://127.0.0.1:8080'\"' ",
+            {"network.proxy_url": "http://127.0.0.1:8080"},
+        ),
+    ],
+)
+def test_remote_resume_transfers_permission_config_to_preload(
+    monkeypatch: pytest.MonkeyPatch,
+    config_flag: str,
+    assignment: str,
+    expected_config: dict[str, object],
+) -> None:
+    fake_client = _FakeCodexAppServerClient()
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    config_args = (
+        (config_flag + assignment,) if config_flag.endswith("=") else (config_flag, assignment)
+    )
+    launch_args = ("--sandbox", "workspace-write", "--ask-for-approval", "never", *config_args)
+
+    asyncio.run(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:9876", "thread_test", terminal_launch_args=launch_args
+        )
+    )
+
+    assert fake_client.requests == [
+        (
+            "thread/resume",
+            {
+                "threadId": "thread_test",
+                "excludeTurns": True,
+                "sandbox": "workspace-write",
+                "approvalPolicy": "never",
+                "config": expected_config,
+            },
+        )
+    ]
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=(0, 155, 0),
+    ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=(0, 153, 1),
+    ) == [*launch_args, "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=(0, 155, 0),
+    ) == [*launch_args, "--remote", "ws://127.0.0.1:9876"]
+
+
+def test_remote_resume_merges_permission_config_without_dropping_profile() -> None:
+    launch_args = (
+        "--sandbox",
+        "workspace-write",
+        "-c",
+        "default_permissions=restricted",
+        "-c",
+        "permissions.restricted.network.enabled=false",
+        "-c",
+        "network.enabled=true",
+        "--config=network.enabled=false",
+        "-c",
+        'model="test-model"',
+    )
+
+    assert codex_native_app_server._codex_resume_permission_params(launch_args) == {
+        "permissions": "restricted",
+        "config": {"permissions.restricted.network.enabled": False, "network.enabled": False},
+    }
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+    ) == ["-c", 'model="test-model"', "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+
+
+@pytest.mark.parametrize(
+    ("assignments", "expected_config"),
+    [
+        (
+            ("network.enabled=false", "network={enabled=true}"),
+            {"network": {"enabled": True}},
+        ),
+        (
+            ("network={enabled=true,proxy_port=8080}", "network.enabled=false"),
+            {"network": {"enabled": False, "proxy_port": 8080}},
+        ),
+        (
+            (
+                "permissions={restricted={network={enabled=true}}}",
+                "permissions.restricted.network.enabled=false",
+            ),
+            {"permissions": {"restricted": {"network": {"enabled": False}}}},
+        ),
+        (
+            (
+                "permissions.restricted.network.enabled=true",
+                "permissions.restricted={network={enabled=false}}",
+                "permissions.restricted.network.proxy_port=8080",
+            ),
+            {"permissions.restricted": {"network": {"enabled": False, "proxy_port": 8080}}},
+        ),
+        (
+            ("permissions.restricted=false", "permissions.restricted.network.enabled=false"),
+            {"permissions.restricted": {"network": {"enabled": False}}},
+        ),
+    ],
+)
+def test_remote_resume_preserves_overlapping_permission_config_order(
+    assignments: tuple[str, ...], expected_config: dict[str, object]
+) -> None:
+    launch_args = (
+        "--sandbox",
+        "workspace-write",
+        *(f"-c={assignment}" for assignment in assignments),
+    )
+    assert codex_native_app_server._codex_resume_permission_params(launch_args) == {
+        "sandbox": "workspace-write",
+        "config": expected_config,
+    }
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+    ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
 
 
 @pytest.mark.parametrize("codex_cli_version", [(0, 136, 0), (0, 153, 0), (0, 153, 1)])
@@ -1076,8 +1255,13 @@ def test_remote_resume_preserves_legacy_bypass_args(
 @pytest.mark.parametrize(
     "args",
     [
-        ("--add-dir", "/extra-workspace"),
-        ("--config", "sandbox_workspace_write.network_access=false"),
+        ("--config", "sandbox_workspace_write.network_access=1979-05-27"),
+        ("--config", "network.proxy_port=nan"),
+        ("--config", "network.proxy_port=inf"),
+        ("--config", "permissions.restricted={network={enabled=1979-05-27}}"),
+        ("--config", "network.enabled"),
+        ("--config", "networking.enabled=false"),
+        ("--config", "permissions_extra.enabled=false"),
         ("--full-auto",),
         ("-c", "approvals_reviewer=false"),
         ("--config", 'sandbox_mode=""'),
@@ -2424,6 +2608,7 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
 
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
@@ -2434,6 +2619,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     thread, and send subsequent status/history events to the new AP
     session.
     """
+    caplog.set_level("INFO", logger="omnigent.harnesses.codex_native.forwarder")
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -2605,6 +2791,13 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         for _, payload in posted_events
         if payload["type"] == "external_conversation_item"
     ] == ["after clear"]
+
+    readiness = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"
+    ]
+    assert len(readiness) == 1
+    assert readiness[0].session_id == "conv_new"
+    assert readiness[0].attributes["runner_id"] == "runner_123"
 
 
 def test_forwarder_rotation_failure_preserves_old_target(

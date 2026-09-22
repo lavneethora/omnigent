@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
 
+from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 
@@ -28,6 +30,9 @@ def runner_inference_verified(conversation: Conversation, response: httpx.Respon
     except ValueError:
         return False
     return isinstance(payload, dict) and payload.get("inference_config_verified") is True
+
+
+_logger = logging.getLogger(__name__)
 
 
 class RunnerSessionInitializer:
@@ -112,7 +117,13 @@ class RunnerSessionInitializer:
                             host_registry=None,
                             tunnel_registry=self._registry,
                         )
-                return await runner_client.post("/v1/sessions", json=payload, timeout=timeout)
+                return await self._post_initialize(
+                    runner_client,
+                    session_id=conversation.id,
+                    runner_id=runner_id,
+                    payload=payload,
+                    timeout=timeout,
+                )
 
             task = asyncio.create_task(
                 post_session_init(),
@@ -158,6 +169,44 @@ class RunnerSessionInitializer:
             if key[2] == session_id:
                 self._tasks.pop(key, None)
                 self._recovery_ids.pop(key, None)
+
+    async def _post_initialize(
+        self,
+        runner_client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        runner_id: str,
+        payload: dict[str, object],
+        timeout: float,
+    ) -> httpx.Response:
+        with runner_log_scope(session_id, runner_id):
+            _logger.info(
+                "Initializing runner session",
+                extra=debug_event("runner_session_init_started", stage="session_init"),
+            )
+            try:
+                response = await runner_client.post(
+                    "/v1/sessions",
+                    json=payload,
+                    timeout=timeout,
+                )
+            except Exception:
+                _logger.exception(
+                    "Runner session initialization failed",
+                    extra=debug_event("runner_session_init_failed", stage="session_init"),
+                )
+                raise
+            failed = not 200 <= response.status_code < 300
+            log = _logger.error if failed else _logger.info
+            log(
+                "Runner session initialization finished",
+                extra=debug_event(
+                    "runner_session_init_failed" if failed else "runner_session_initialized",
+                    stage="session_init",
+                    status_code=response.status_code,
+                ),
+            )
+            return response
 
     def invalidate_runner(self, runner_id: str) -> None:
         """Forget completed readiness when a runner tunnel goes away."""

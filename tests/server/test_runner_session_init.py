@@ -358,3 +358,30 @@ async def test_attachment_validation_preserves_single_flight(db_uri: str) -> Non
     first_response, second_response = await asyncio.gather(first, second)
     assert first_response is second_response
     assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
+    from tests.debug_log_helpers import capture_debug_rows
+
+    registry = _Registry()
+    client = _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conversation = _conversation()
+    with capture_debug_rows("server") as rows:
+        client.status_code = 503
+        await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
+        client.status_code = 201
+        await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
+        await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
+    events = [row for row in rows if row["event_name"]]
+    assert [row["event_name"] for row in events] == [
+        "runner_session_init_started",
+        "runner_session_init_failed",
+        "runner_session_init_started",
+        "runner_session_initialized",
+    ]
+    assert all(row["session_id"] == conversation.id for row in events)
+    assert all(row["attributes"]["runner_id"] == conversation.runner_id for row in events)
+    assert events[1]["attributes"]["status_code"] == "503"
