@@ -2260,17 +2260,13 @@ def _attachment_fork_client(
         conversations={source_id: _make_conversation()},
         items_by_conv={source_id: [first, attached]},
     )
-    file_store = _FileStore(
-        files={
-            file_id: StoredFile(
-                id=file_id,
-                created_at=1,
-                filename=filename,
-                bytes=4,
-                content_type="application/octet-stream",
-                session_id=source_id,
-            )
-        }
+    file_store = _FileStore()
+    file_store.create(
+        filename,
+        bytes=4,
+        content_type="application/octet-stream",
+        session_id=source_id,
+        file_id=file_id,
     )
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.get_agent_cache",
@@ -2328,44 +2324,50 @@ def test_fork_checks_attachment_history_before_creating_session(
 
 
 @pytest.mark.parametrize(
-    "filename,cutoff,expected_status",
+    "filename,cutoff,referenced,expected_status",
     [
-        ("sample.zip", "resp_before", 201),
-        ("sample.zip", "resp_attached", 400),
-        ("sample.png", "resp_attached", 201),
-        ("sample.txt", "resp_attached", 201),
+        ("sample.zip", "resp_before", True, 201),
+        ("sample.zip", "resp_attached", True, 400),
+        ("sample.png", "resp_attached", True, 201),
+        ("sample.txt", "resp_attached", True, 201),
+        ("sample.zip", None, False, 201),
     ],
 )
 def test_fork_attachment_check_honors_retained_history(
-    monkeypatch: pytest.MonkeyPatch, filename: str, cutoff: str, expected_status: int
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    cutoff: str | None,
+    referenced: bool,
+    expected_status: int,
 ) -> None:
-    """Earlier forks and ordinary image/text attachments remain available to SDKs."""
-    client, _, _ = _attachment_fork_client(monkeypatch, filename, "openai-agents")
+    """Only retained file references constrain the fork target; image/text remain portable."""
+    client, conv_store, _ = _attachment_fork_client(monkeypatch, filename, "openai-agents")
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    if not referenced:
+        conv_store._items[source_id] = conv_store._items[source_id][:1]
     response = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        f"/v1/sessions/{source_id}/fork",
         json={"agent_id": "280d725b404d2915f9e9d6cccce91303", "up_to_response_id": cutoff},
     )
     assert response.status_code == expected_status, response.text
 
 
-def test_fork_ignores_unreferenced_uploads(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An uploaded file that was never sent does not constrain the fork target."""
-    client, conv_store, _ = _attachment_fork_client(monkeypatch, "sample.zip", "openai-agents")
-    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
-    conv_store._items[source_id] = conv_store._items[source_id][:1]
-    response = client.post(
-        f"/v1/sessions/{source_id}/fork",
-        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
-    )
-    assert response.status_code == 201, response.text
-
-
-def test_fork_attachment_check_reads_all_metadata_and_history_pages(
+@pytest.mark.parametrize(
+    "target_harness,policy,expected_status",
+    [
+        ("openai-agents", {}, 400),
+        ("claude-native", {"filesystem_attachment_denied_extensions": ["zip"]}, 415),
+    ],
+)
+def test_fork_attachment_checks_paginate_before_mutation(
     monkeypatch: pytest.MonkeyPatch,
+    target_harness: str,
+    policy: dict[str, Any],
+    expected_status: int,
 ) -> None:
-    """A long transcript and many uploads cannot hide an incompatible attachment."""
+    """Harness compatibility and policy admission check beyond the first page."""
     client, conv_store, file_store = _attachment_fork_client(
-        monkeypatch, "sample.zip", "openai-agents"
+        monkeypatch, "sample.zip", target_harness
     )
     source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
     for index in range(1001):
@@ -2384,13 +2386,19 @@ def test_fork_attachment_check_reads_all_metadata_and_history_pages(
         for index in range(1001)
     }
     file_store.files.update(original_files)
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: policy)
     response = client.post(
         f"/v1/sessions/{source_id}/fork",
         json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
     )
-    assert response.status_code == 400, response.text
-    assert "sample.zip" in response.json()["error"]["message"]
+    assert response.status_code == expected_status, response.text
+    if expected_status == 400:
+        assert "sample.zip" in response.json()["error"]["message"]
+    else:
+        assert "not accepted" in response.json()["detail"]
     assert not conv_store.fork_calls
+    assert len(conv_store._convs) == 1
+    assert len(file_store.files) == 1002
 
 
 @pytest.mark.parametrize("cutoff", [None, "resp_before"])
@@ -2427,14 +2435,7 @@ def test_fork_enforces_current_policy_before_creating_destination(
     for index, (filename, size) in enumerate(
         [("unsent.docx", 4), ("ordinary.txt", 100), ("image.png", 100)]
     ):
-        file_id = f"{index:032x}"
-        file_store.files[file_id] = StoredFile(
-            id=file_id,
-            created_at=1,
-            filename=filename,
-            bytes=size,
-            session_id=source_id,
-        )
+        file_store.create(filename, bytes=size, session_id=source_id, file_id=f"{index:032x}")
     original_files = dict(file_store.files)
     monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: policy)
 
@@ -2453,37 +2454,3 @@ def test_fork_enforces_current_policy_before_creating_destination(
         assert not conv_store.fork_calls
         assert len(conv_store._convs) == 1
         assert file_store.files == original_files
-
-
-def test_fork_validates_attachment_policy_across_all_file_pages(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Admission checks the complete file batch before creating the destination."""
-    client, conv_store, file_store = _attachment_fork_client(
-        monkeypatch, "sample.zip", "claude-native"
-    )
-    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
-    original_files = file_store.files
-    file_store.files = {
-        f"{index:032x}": StoredFile(
-            id=f"{index:032x}",
-            created_at=1,
-            filename="ordinary.txt",
-            bytes=1,
-            session_id=source_id,
-        )
-        for index in range(1001)
-    }
-    file_store.files.update(original_files)
-    monkeypatch.setattr(
-        "omnigent.server.server_config.load_server_config",
-        lambda: {"filesystem_attachment_denied_extensions": ["zip"]},
-    )
-
-    response = client.post(f"/v1/sessions/{source_id}/fork", json={})
-
-    assert response.status_code == 415, response.text
-    assert "not accepted" in response.json()["detail"]
-    assert not conv_store.fork_calls
-    assert len(conv_store._convs) == 1
-    assert len(file_store.files) == 1002

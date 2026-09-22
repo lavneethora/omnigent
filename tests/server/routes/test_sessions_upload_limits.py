@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from unittest.mock import Mock
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -86,60 +87,53 @@ def upload_client(db_uri: str, tmp_path) -> Iterator[tuple[TestClient, str]]:
         yield client, conv.id
 
 
-def test_upload_small_text_file_succeeds(upload_client: tuple[TestClient, str]) -> None:
-    """A small text file uploads and returns a resource."""
-    client, session_id = upload_client
-    resp = client.post(
+def _upload(
+    client: TestClient,
+    session_id: str,
+    filename: str,
+    data: bytes = b"data",
+    content_type: str = "application/octet-stream",
+) -> httpx.Response:
+    """Post a multipart file through the actual upload route."""
+    return client.post(
         f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("notes.txt", b"hello world", "text/plain")},
+        files={"file": (filename, data, content_type)},
     )
-    assert resp.status_code in (200, 201), resp.text
-    body = resp.json()
-    assert body["name"] == "notes.txt"
-
-
-def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) -> None:
-    """A type that is neither inlinable nor usable with filesystem tools is
-    rejected with 415, not stored."""
-    client, session_id = upload_client
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("clip.mp4", b"\x00\x00\x00 fake mp4 bytes", "video/mp4")},
-    )
-    assert resp.status_code == 415, resp.text
-    assert "Unsupported attachment type" in resp.text
 
 
 @pytest.mark.parametrize(
-    ("filename", "mime"),
+    "filename,content_type",
     [
+        ("notes.txt", "text/plain"),
         ("archive.zip", "application/zip"),
-        (
-            "deck.pptx",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        ),
+        ("deck.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
         ("app.db", "application/octet-stream"),
+        ("report.docx", "application/zip"),
+        ("data.csv", "application/vnd.ms-excel"),
     ],
 )
-def test_upload_accepts_filesystem_types(
-    upload_client: tuple[TestClient, str], filename: str, mime: str
+def test_upload_supported_types(
+    upload_client: tuple[TestClient, str], filename: str, content_type: str
 ) -> None:
-    """Archives, office docs, and databases upload instead of 415ing, since a
-    filesystem-capable harness reads them off disk rather than inlining them."""
+    """Supported extensions remain usable even with common browser MIME mismatches."""
     client, session_id = upload_client
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": (filename, b"PK\x03\x04 fake bytes", mime)},
-    )
-    assert resp.status_code in (200, 201), resp.text
-    assert resp.json()["name"] == filename
+    response = _upload(client, session_id, filename, content_type=content_type)
+    assert response.status_code == 201, response.text
+    assert response.json()["name"] == filename
+
+
+def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) -> None:
+    """Unsupported formats are rejected with 415."""
+    client, session_id = upload_client
+    resp = _upload(client, session_id, "clip.mp4", b"\x00\x00\x00 fake mp4 bytes", "video/mp4")
+    assert resp.status_code == 415, resp.text
+    assert "Unsupported attachment type" in resp.text
 
 
 def test_upload_rejects_filesystem_types_for_an_unsupported_harness(
     upload_client: tuple[TestClient, str], db_uri: str
 ) -> None:
-    """Only Claude Code and Codex open these file types. Any other harness would
-    receive the zip inlined and drop it, so the upload is refused up front."""
+    """An SDK session refuses formats requiring native filesystem tools."""
     client, _ = upload_client
     sdk_session = SqlAlchemyConversationStore(db_uri).create_conversation(
         title="sdk session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
@@ -182,30 +176,13 @@ def test_message_cannot_inline_a_filesystem_attachment(
     assert "payload.zip" in resp.text
 
 
-def test_upload_docx_mislabeled_as_zip_is_accepted(
-    upload_client: tuple[TestClient, str],
-) -> None:
-    """Office formats are zip containers, so browsers routinely report them as
-    application/zip. The extension decides, not the declared MIME."""
-    client, session_id = upload_client
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("report.docx", b"PK\x03\x04 fake docx bytes", "application/zip")},
-    )
-    assert resp.status_code in (200, 201), resp.text
-    assert resp.json()["name"] == "report.docx"
-
-
 def test_upload_rejects_oversized_filesystem_file(
     upload_client: tuple[TestClient, str],
 ) -> None:
     """A zip over the filesystem per-file cap is rejected with 413."""
     client, session_id = upload_client
     oversized = b"\x00" * (MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES + 1)
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("huge.zip", oversized, "application/zip")},
-    )
+    resp = _upload(client, session_id, "huge.zip", oversized, "application/zip")
     assert resp.status_code == 413, resp.status_code
 
 
@@ -222,10 +199,7 @@ def test_upload_rejects_undecodable_oversized_image(
 
     client, session_id = upload_client
     oversized = b"\x00" * (IMAGE_MODEL_BUDGET_BYTES + 1)
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("huge.png", oversized, "image/png")},
-    )
+    resp = _upload(client, session_id, "huge.png", oversized, "image/png")
     assert resp.status_code == 413, resp.status_code
 
 
@@ -247,10 +221,7 @@ def test_upload_large_image_is_compressed_under_budget(
     payload = buffer.getvalue()
     assert len(payload) > IMAGE_MODEL_BUDGET_BYTES
 
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("screenshot.png", payload, "image/png")},
-    )
+    resp = _upload(client, session_id, "screenshot.png", payload, "image/png")
     assert resp.status_code in (200, 201), resp.text
     body = resp.json()
     assert body["metadata"]["bytes"] <= IMAGE_MODEL_BUDGET_BYTES
@@ -259,139 +230,85 @@ def test_upload_large_image_is_compressed_under_budget(
     assert body["name"] in ("screenshot.webp", "screenshot.jpg")
 
 
-def test_upload_csv_mislabeled_as_excel_is_accepted(
-    upload_client: tuple[TestClient, str],
-) -> None:
-    """A .csv the browser tags application/vnd.ms-excel is accepted via the
-    extension fallback and stored as a text type (parity with the web client)."""
-    client, session_id = upload_client
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("data.csv", b"a,b,c\n1,2,3\n", "application/vnd.ms-excel")},
-    )
-    assert resp.status_code in (200, 201), resp.text
-    assert resp.json()["name"] == "data.csv"
-
-
 def test_upload_text_just_under_limit_succeeds(upload_client: tuple[TestClient, str]) -> None:
     """A text file just under the text cap is accepted."""
     client, session_id = upload_client
     payload = b"a" * (MAX_TEXT_UPLOAD_BYTES - 1024)
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("big.txt", payload, "text/plain")},
-    )
+    resp = _upload(client, session_id, "big.txt", payload, "text/plain")
     assert resp.status_code in (200, 201), resp.status_code
 
 
-class _FakeUpload:
-    """Minimal UploadFile stand-in exposing the chunked ``read`` interface."""
+@pytest.mark.parametrize("size,rejected", [(100, False), (101, True)])
+async def test_read_upload_capped_boundary(size: int, rejected: bool) -> None:
+    """The read cap admits the exact limit and rejects one byte more."""
+    from io import BytesIO
 
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-        self._pos = 0
-
-    async def read(self, size: int) -> bytes:
-        chunk = self._data[self._pos : self._pos + size]
-        self._pos += len(chunk)
-        return chunk
-
-
-async def test_read_upload_capped_allows_exactly_at_limit() -> None:
-    """A payload exactly at the limit is accepted (the ``>`` boundary)."""
-    from omnigent.server.routes.sessions import _read_upload_capped
-
-    data = b"x" * 100
-    assert await _read_upload_capped(_FakeUpload(data), 100) == data
-
-
-async def test_read_upload_capped_rejects_one_over_limit() -> None:
-    """One byte over the limit raises HTTP 413."""
-    import pytest as _pytest
-    from fastapi import HTTPException
+    from fastapi import HTTPException, UploadFile
 
     from omnigent.server.routes.sessions import _read_upload_capped
 
-    with _pytest.raises(HTTPException) as exc_info:
-        await _read_upload_capped(_FakeUpload(b"x" * 101), 100)
-    assert exc_info.value.status_code == 413
+    data = b"x" * size
+    upload = UploadFile(file=BytesIO(data))
+    if rejected:
+        with pytest.raises(HTTPException) as error:
+            await _read_upload_capped(upload, 100)
+        assert error.value.status_code == 413
+    else:
+        assert await _read_upload_capped(upload, 100) == data
 
 
-def test_upload_rejects_an_extension_the_deployment_denies(
+@pytest.mark.parametrize(
+    "filename,content_type,status",
+    [
+        ("archive.zip", "application/zip", 415),
+        ("archive.zip", "text/plain", 415),
+        ("report.docx", "application/zip", 201),
+    ],
+)
+def test_upload_denylist_uses_filename(
     upload_client: tuple[TestClient, str],
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content_type: str,
+    status: int,
 ) -> None:
-    """
-    An operator can narrow the built-in allowlist without a code change.
-
-    Without this a deployment that must not accept archives has no way to
-    refuse them short of forking, which is what the issue's "allow deployments
-    to deny selected MIME types or extensions" requirement is for.
-    """
+    """The denylist rejects matching extensions regardless of the declared MIME."""
     monkeypatch.setattr(
         "omnigent.server.server_config.filesystem_attachment_denied_extensions",
         lambda: frozenset({".zip"}),
     )
     client, session_id = upload_client
-
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("archive.zip", b"PK\x03\x04 fake zip", "application/zip")},
-    )
-
-    assert resp.status_code == 415, resp.text
-    assert "not accepted by this deployment" in resp.text
+    response = _upload(client, session_id, filename, content_type=content_type)
+    assert response.status_code == status, response.text
+    if status == 415:
+        assert "not accepted by this deployment" in response.text
+    else:
+        assert response.json()["name"] == filename
 
 
-def test_upload_still_accepts_a_type_the_denylist_does_not_name(
+@pytest.mark.parametrize(
+    "existing,limit,status",
+    [(["a.zip", "b.zip"], 2, 413), (["a.txt", "b.txt", "c.txt"], 1, 201)],
+)
+def test_upload_quota_counts_only_filesystem_types(
     upload_client: tuple[TestClient, str],
     monkeypatch: pytest.MonkeyPatch,
+    existing: list[str],
+    limit: int,
+    status: int,
 ) -> None:
-    """The denylist narrows the allowlist precisely, not wholesale."""
+    """Only filesystem formats spend the quota across successive uploads."""
     monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_denied_extensions",
-        lambda: frozenset({".zip"}),
+        "omnigent.server.server_config.filesystem_attachment_file_limit", lambda: limit
     )
     client, session_id = upload_client
-
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("report.docx", b"PK\x03\x04 fake docx", "application/zip")},
-    )
-
-    assert resp.status_code in (200, 201), resp.text
-
-
-def test_upload_rejects_once_the_session_file_quota_is_spent(
-    upload_client: tuple[TestClient, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    The per-session file count is enforced across uploads, not per request.
-
-    Counting only the current upload would let a session accumulate unbounded
-    files in the sandbox one request at a time.
-    """
-    monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_file_limit",
-        lambda: 2,
-    )
-    client, session_id = upload_client
-
-    for i in range(2):
-        ok = client.post(
-            f"/v1/sessions/{session_id}/resources/files",
-            files={"file": (f"a{i}.zip", b"PK\x03\x04 fake zip", "application/zip")},
-        )
-        assert ok.status_code in (200, 201), ok.text
-
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("third.zip", b"PK\x03\x04 fake zip", "application/zip")},
-    )
-
-    assert resp.status_code == 413, resp.text
-    assert "file attachments" in resp.text
+    for filename in existing:
+        response = _upload(client, session_id, filename)
+        assert response.status_code == 201, response.text
+    response = _upload(client, session_id, "bundle.zip")
+    assert response.status_code == status, response.text
+    if status == 413:
+        assert "file attachments" in response.text
 
 
 async def test_parallel_uploads_cannot_overspend_the_filesystem_quota(
@@ -438,72 +355,10 @@ async def test_parallel_uploads_cannot_overspend_the_filesystem_quota(
     ]
 
 
-def test_inlined_attachments_do_not_spend_the_filesystem_quota(
-    upload_client: tuple[TestClient, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Images and text never reach the sandbox filesystem, so they must not
-    count against a quota that exists to bound sandbox disk use.
-    """
-    monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_file_limit",
-        lambda: 1,
-    )
-    client, session_id = upload_client
-
-    for name in ("a.txt", "b.txt", "c.txt"):
-        filler = client.post(
-            f"/v1/sessions/{session_id}/resources/files",
-            files={"file": (name, b"hello", "text/plain")},
-        )
-        assert filler.status_code in (200, 201), filler.text
-
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("bundle.zip", b"PK\x03\x04 fake zip", "application/zip")},
-    )
-
-    assert resp.status_code in (200, 201), resp.text
-
-
-def test_declared_text_mime_cannot_skip_the_filesystem_policy(
-    upload_client: tuple[TestClient, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A zip sent as ``text/plain`` still goes through the upload checks.
-
-    Delivery follows the filename, so trusting the declared MIME would store
-    the archive as inline text, skip the denylist and quota, and still have
-    the executor write it to the cache.
-    """
-    monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_denied_extensions",
-        lambda: frozenset({".zip"}),
-    )
-    client, session_id = upload_client
-
-    resp = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("archive.zip", b"PK\x03\x04 fake zip", "text/plain")},
-    )
-
-    assert resp.status_code == 415, resp.text
-    assert "not accepted by this deployment" in resp.text
-
-
 def test_quota_counts_filesystem_files_past_any_page_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    These file types are counted however many inline files precede them.
-
-    Stopping after a fixed number of pages let a session bury filesystem
-    uploads behind enough inline ones and exceed its configured limit. The
-    fake store serves one record per page so the zip sits past the point where
-    the old 20-page scan stopped.
-    """
+    """Quota accounting walks beyond 20 pages of ordinary files."""
     from fastapi import HTTPException
 
     from omnigent.entities import StoredFile
@@ -550,10 +405,7 @@ def test_old_host_refuses_new_types_without_storing(
     """A legacy hello cannot promise cold resume; rejection leaves no file row."""
     client, session_id = upload_client
     client.app.state.host_registry.get("d75381f2c94b4e49a3c684946d4ddbc4").hello.capabilities = []
-    response = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": (filename, b"data", "application/octet-stream")},
-    )
+    response = _upload(client, session_id, filename, b"data", "application/octet-stream")
     assert response.status_code == 409, response.text
     assert "Update Omnigent" in response.text
     assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
@@ -573,10 +425,7 @@ def test_old_host_keeps_existing_attachment_types(upload_client: tuple[TestClien
         ("table.csv", b"a,b\n1,2\n", "text/csv"),
         ("picture.png", image.getvalue(), "image/png"),
     ):
-        response = client.post(
-            f"/v1/sessions/{session_id}/resources/files",
-            files={"file": (filename, data, mime)},
-        )
+        response = _upload(client, session_id, filename, data, mime)
         assert response.status_code == 201, response.text
 
 
@@ -637,10 +486,7 @@ def test_recovered_host_ignores_stale_managed_launch_failure(
     tracker.begin(session_id)
     tracker.fail(session_id, "earlier provision failed")
     client.app.state.managed_launches = tracker
-    response = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("archive.zip", b"data", "application/zip")},
-    )
+    response = _upload(client, session_id, "archive.zip", b"data", "application/zip")
     assert response.status_code == 201, response.text
 
 
@@ -651,10 +497,7 @@ def test_unbound_upload_requires_a_connected_runtime(
     """An unknown host cannot be assumed current just because the server is new."""
     client, session_id = upload_client
     SqlAlchemyConversationStore(db_uri).clear_host_binding(session_id)
-    response = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("archive.zip", b"data", "application/zip")},
-    )
+    response = _upload(client, session_id, "archive.zip", b"data", "application/zip")
     assert response.status_code == 409, response.text
     assert "Connect an updated" in response.text
     assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
@@ -681,10 +524,7 @@ def test_upload_wakes_a_sleeping_runtime_before_checking_support(
 
     ensure = AsyncMock(side_effect=wake)
     monkeypatch.setattr(routes_resources, "ensure_runner_connected", ensure)
-    response = client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("archive.zip", b"data", "application/zip")},
-    )
+    response = _upload(client, session_id, "archive.zip", b"data", "application/zip")
     assert response.status_code == 201, response.text
     ensure.assert_awaited_once()
 

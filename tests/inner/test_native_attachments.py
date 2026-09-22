@@ -331,34 +331,28 @@ def _zip_block(filename: str = "archive.zip") -> dict[str, object]:
     return {"type": "input_file", "file_data": _ZIP_DATA_URI, "filename": filename}
 
 
-def test_materialize_cache_writes_under_attachments_dir(tmp_path: Path) -> None:
-    """Decoded bytes land in the session attachment cache."""
+@pytest.mark.parametrize("existing_mode", [None, 0o600, 0o755])
+def test_materialize_cache_creates_or_reuses_non_executable_files(
+    tmp_path: Path, existing_mode: int | None
+) -> None:
+    """Fresh and reused files keep their bytes, path, and non-executable permissions."""
+    expected = attachment_cache_dir(tmp_path) / "archive.zip"
+    if existing_mode is not None:
+        expected.parent.mkdir(parents=True)
+        expected.write_bytes(_ZIP_BYTES)
+        expected.chmod(existing_mode)
+
     path = materialize_attachment(_zip_block(), tmp_path)
 
-    assert path == attachment_cache_dir(tmp_path) / "archive.zip"
+    assert path == expected
     assert path.read_bytes() == _ZIP_BYTES
-
-
-def test_materialize_cache_strips_executable_bits(tmp_path: Path) -> None:
-    """
-    A materialized file is never executable.
-
-    Uploads are untrusted input; leaving the execute bit set (from a
-    permissive umask) would let an attached binary be run directly in the
-    sandbox rather than merely read.
-    """
-    path = materialize_attachment(_zip_block("payload.zip"), tmp_path)
-
-    assert path is not None
     assert path.stat().st_mode & 0o111 == 0
+    assert materialize_attachment(_zip_block(), tmp_path) == path
+    assert list(path.parent.iterdir()) == [path]
 
 
 def test_materialize_cache_contains_path_traversal(tmp_path: Path) -> None:
-    """
-    A traversal filename is written inside the attachments dir, not above it.
-
-    Failure would let an upload overwrite arbitrary files outside the cache by name alone.
-    """
+    """Traversal components cannot place an attachment outside its cache."""
     path = materialize_attachment(_zip_block("../../escaped.zip"), tmp_path)
 
     assert path is not None
@@ -366,40 +360,29 @@ def test_materialize_cache_contains_path_traversal(tmp_path: Path) -> None:
     assert not (tmp_path.parent / "escaped.zip").exists()
 
 
-def test_materialize_cache_refuses_symlinked_destination(tmp_path: Path) -> None:
-    """
-    An existing symlink at the destination is refused, not followed.
-
-    Writing through it would land the bytes wherever the link points,
-    outside the cache if an earlier turn planted the link.
-    """
+@pytest.mark.parametrize("collision", [False, True])
+@pytest.mark.parametrize("outside_exists", [False, True])
+def test_materialize_cache_refuses_symlinked_destination(
+    tmp_path: Path, collision: bool, outside_exists: bool
+) -> None:
+    """Neither the original nor collision filename may redirect a cache write."""
     attachments_dir = attachment_cache_dir(tmp_path)
     attachments_dir.mkdir(parents=True)
-    outside = tmp_path.parent / "outside-target.zip"
-    (attachments_dir / "archive.zip").symlink_to(outside)
-
-    assert materialize_attachment(_zip_block(), tmp_path) is None
-    assert not outside.exists()
-
-
-def test_materialize_cache_refuses_symlink_at_collision_name(tmp_path: Path) -> None:
-    """
-    A symlink planted at the digest-suffixed collision name is refused.
-
-    The original name is taken by other content, which diverts the write to
-    ``<stem>_<sha12><suffix>``. That name is predictable, so a link placed
-    there must not redirect the write onto a file outside the cache.
-    """
-    attachments_dir = attachment_cache_dir(tmp_path)
-    attachments_dir.mkdir(parents=True)
-    (attachments_dir / "archive.zip").write_bytes(b"different content")
     outside = tmp_path.parent / f"{tmp_path.name}-outside.zip"
-    outside.write_bytes(b"precious")
-    digest = hashlib.sha256(_ZIP_BYTES).hexdigest()[:12]
-    (attachments_dir / f"archive_{digest}.zip").symlink_to(outside)
+    if outside_exists:
+        outside.write_bytes(b"precious")
+    destination = attachments_dir / "archive.zip"
+    if collision:
+        destination.write_bytes(b"different content")
+        digest = hashlib.sha256(_ZIP_BYTES).hexdigest()[:12]
+        destination = attachments_dir / f"archive_{digest}.zip"
+    destination.symlink_to(outside)
 
     assert materialize_attachment(_zip_block(), tmp_path) is None
-    assert outside.read_bytes() == b"precious"
+    if outside_exists:
+        assert outside.read_bytes() == b"precious"
+    else:
+        assert not outside.exists()
 
 
 def test_materialize_cache_refuses_symlinked_attachments_dir(tmp_path: Path) -> None:
@@ -426,37 +409,6 @@ def test_materialize_cache_does_not_overwrite_when_both_names_taken(
     assert materialize_attachment(_zip_block(), tmp_path) is None
     assert (attachments_dir / "archive.zip").read_bytes() == b"first"
     assert (attachments_dir / f"archive_{digest}.zip").read_bytes() == b"second"
-
-
-def test_materialize_cache_reuses_identical_file(tmp_path: Path) -> None:
-    """
-    Re-materializing the same block reuses the file. The runner re-resolves
-    history blocks after a relaunch, so a restart must not multiply copies.
-    """
-    first = materialize_attachment(_zip_block(), tmp_path)
-    second = materialize_attachment(_zip_block(), tmp_path)
-
-    assert first == second
-    assert len(list((attachment_cache_dir(tmp_path)).iterdir())) == 1
-
-
-def test_materialize_cache_clears_executable_bits_on_reuse(tmp_path: Path) -> None:
-    """
-    An identical file already present with execute bits is reused non-executable.
-
-    Reuse returns early, so without clearing the bits there a pre-placed
-    executable copy would stay runnable despite the attachment contract.
-    """
-    attachments_dir = attachment_cache_dir(tmp_path)
-    attachments_dir.mkdir(parents=True)
-    existing = attachments_dir / "archive.zip"
-    existing.write_bytes(_ZIP_BYTES)
-    existing.chmod(0o755)
-
-    path = materialize_attachment(_zip_block(), tmp_path)
-
-    assert path == existing
-    assert path.stat().st_mode & 0o111 == 0
 
 
 def test_attachment_cache_isolates_sessions_and_leaves_git_workspace_clean(
@@ -510,34 +462,13 @@ def test_requires_filesystem_false_for_other_types(filename: str | None) -> None
 
 async def test_relaunch_re_resolution_keeps_a_zip_on_the_filesystem_path() -> None:
     """Restored metadata keeps ZIP files on the filesystem input path."""
-
-    class _Resp:
-        """Minimal httpx-Response stand-in for metadata and content."""
-
-        def __init__(self, *, body: bytes = b"", payload: dict[str, object] | None = None) -> None:
-            self.content = body
-            self._payload = payload or {}
-            self.headers = {"content-type": "application/zip"}
-
-        def json(self) -> dict[str, object]:
-            return self._payload
-
-        def raise_for_status(self) -> None:
-            return
-
-    class _Client:
-        """Serves the two GETs re-resolution makes per attachment."""
-
-        async def get(self, url: str, **kwargs: object) -> _Resp:
-            del kwargs
-            if url.endswith("/content"):
-                return _Resp(body=_ZIP_BYTES)
-            return _Resp(payload={"filename": "bundle.zip", "content_type": "application/zip"})
-
+    client = _FakeFileClient(
+        {"filename": "bundle.zip", "content_type": "application/zip"}, body=_ZIP_BYTES
+    )
     block = {"type": "input_file", "file_id": "file_zip", "filename": "bundle.zip"}
     assert has_unresolved_file_id(block)
 
-    result = await resolve_file_id_block(block, session_id="conv_1", client=_Client())
+    result = await resolve_file_id_block(block, session_id="conv_1", client=client)
 
     assert result is not None
     resolved, _notice = result
@@ -546,39 +477,11 @@ async def test_relaunch_re_resolution_keeps_a_zip_on_the_filesystem_path() -> No
 
 
 async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
-    """
-    A client cannot relabel an uploaded file by naming it differently in the message.
-
-    ``payload.txt`` passed the upload gate as inline text. Referencing it as
-    ``payload.db`` would otherwise bypass the upload denylist and quotas.
-    """
-
-    class _Resp:
-        """Minimal httpx-Response stand-in for metadata and content."""
-
-        def __init__(self, *, body: bytes = b"", payload: dict[str, object] | None = None) -> None:
-            self.content = body or b"{}"
-            self._payload = payload or {}
-            self.headers = {"content-type": "text/plain"}
-
-        def json(self) -> dict[str, object]:
-            return self._payload
-
-        def raise_for_status(self) -> None:
-            return
-
-    class _Client:
-        """Serves the stored metadata and bytes for one text upload."""
-
-        async def get(self, url: str, **kwargs: object) -> _Resp:
-            del kwargs
-            if url.endswith("/content"):
-                return _Resp(body=b"hello")
-            return _Resp(payload={"name": "payload.txt", "content_type": "text/plain"})
-
+    """Stored filenames govern admission and delivery despite a conflicting message name."""
+    client = _FakeFileClient({"name": "payload.txt", "content_type": "text/plain"}, body=b"hello")
     block = {"type": "input_file", "file_id": "file_txt", "filename": "payload.db"}
 
-    result = await resolve_file_id_block(block, session_id="conv_1", client=_Client())
+    result = await resolve_file_id_block(block, session_id="conv_1", client=client)
 
     assert result is not None
     resolved, _notice = result
@@ -587,15 +490,7 @@ async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
 
 
 def test_client_server_filesystem_extension_parity() -> None:
-    """
-    The two filesystem allowlists must name the same extensions.
-
-    The client gate runs before upload, so a type the server accepts but the
-    client omits is unreachable from the web UI: the file is rejected at
-    paste/drop time and the server code never runs. The existing text/code
-    parity test only covers the client-to-server direction, which leaves that
-    failure silent.
-    """
+    """Client and server accept the same filesystem attachment extensions."""
     from omnigent.inner.native_attachments import _FILESYSTEM_ATTACHMENT_EXTENSIONS
 
     ts_path = Path(__file__).resolve().parents[2] / "web" / "src" / "lib" / "attachments.ts"
@@ -649,13 +544,14 @@ class _FakeFileResponse:
 class _FakeFileClient:
     """Serves a metadata payload and content bytes for resolve_file_id_block."""
 
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(self, payload: dict[str, Any], *, body: bytes = b"webp-bytes") -> None:
         self._payload = payload
+        self._body = body
 
     async def get(self, url: str, **kwargs: Any) -> _FakeFileResponse:
         del kwargs
         if url.endswith("/content"):
-            return _FakeFileResponse(body=b"webp-bytes")
+            return _FakeFileResponse(body=self._body, payload=self._payload)
         # Non-empty body so resolve_file_id_block parses .json() (it skips
         # parsing when the metadata response has no content).
         return _FakeFileResponse(body=b"{}", payload=self._payload)
