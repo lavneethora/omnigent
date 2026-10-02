@@ -197,6 +197,12 @@ def test_attach_tsv_the_server_accepts(
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
 
     file_input = page.locator('input[type="file"][accept*="image/"]')
+    # Browsers that don't map .tsv to a text/* type grey the file out in the OS
+    # picker, so the extension has to be listed even though .csv rides text/*.
+    accept = file_input.get_attribute("accept")
+    assert accept is not None and ".tsv" in accept, (
+        f"composer file input should accept .tsv; got {accept!r}"
+    )
     # A binary MIME forces classification to use the extension allowlist.
     file_input.set_input_files(
         {
