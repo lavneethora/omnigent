@@ -194,7 +194,14 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     expect(composer).to_be_visible(timeout=30_000)
 
     composer.fill("summarize these photos")
-    page.get_by_test_id("new-chat-landing-file-input").set_input_files(str(sample))
+    landing_input = page.get_by_test_id("new-chat-landing-file-input")
+    # This screen carries its own picker filter, so a .tsv dropped from the
+    # chat composer's list would still be greyed out here.
+    landing_accept = landing_input.get_attribute("accept")
+    assert landing_accept is not None and ".tsv" in landing_accept, (
+        f"landing file input should accept .tsv; got {landing_accept!r}"
+    )
+    landing_input.set_input_files(str(sample))
 
     # Rejected: no chip, and the reason names the file.
     expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
