@@ -134,13 +134,12 @@ def test_reject_unsupported_type(
 
 
 def test_attach_tsv_the_server_accepts(
-    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+    page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
     """Accept .tsv through the file input even when the OS reports a binary MIME."""
-    del tmp_path
-    base_url, session_id = seeded_session
+    chat = chat_session_contract
 
-    page.goto(f"{base_url}/c/{session_id}")
+    page.goto(chat.url)
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
 
     file_input = page.locator('input[type="file"][accept*="image/"]')
