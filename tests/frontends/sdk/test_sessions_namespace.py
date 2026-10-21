@@ -371,11 +371,13 @@ async def test_get_reduced_snapshot_reports_excluded_data_as_unknown() -> None:
         payload = _session_response_body()
         # What the server sends back for include_usage=false,
         # include_liveness=false: null fields plus the usage indicator.
+        # host_resumable is read from the host store, not the liveness
+        # lookup, so the server still sends a bool for it here.
         payload.update(
             {
                 "runner_online": None,
                 "host_online": None,
-                "host_resumable": None,
+                "host_resumable": False,
                 "total_cost_usd": None,
                 "usage_by_model": None,
                 "usage_included": False,
@@ -399,7 +401,7 @@ async def test_get_reduced_snapshot_reports_excluded_data_as_unknown() -> None:
     assert session.usage_by_model is None
     assert session.runner_online is None
     assert session.host_online is None
-    assert session.host_resumable is None
+    assert session.host_resumable is False
     # The server returns [] for an excluded transcript too, so the flag is
     # the only thing separating "not asked for" from "none committed".
     assert session.items == []
@@ -457,6 +459,29 @@ async def test_get_usage_included_defaults_to_true_on_older_servers() -> None:
 
     assert session.usage_included is True
     assert session.total_cost_usd == 1.25
+
+
+@pytest.mark.asyncio
+async def test_patch_snapshot_reports_items_as_excluded() -> None:
+    """A PATCH response's empty ``items`` is not evidence of an empty transcript.
+
+    ``PATCH /v1/sessions/{id}`` always builds its snapshot without the
+    items read, so a caller that trusted the empty list would conclude a
+    session with committed history has none.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.set_archived("conv_abc", archived=True)
+    finally:
+        await client.aclose()
+
+    assert session.items == []
+    assert session.items_included is False
 
 
 # ── bind_runner() ────────────────────────────────────────────────────

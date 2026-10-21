@@ -188,8 +188,9 @@ class Session:
         ``None`` when liveness was not requested or the session has no
         host (CLI/local).
     :param host_resumable: Whether the session is bound to a dormant
-        managed host the server can wake in place. ``None`` when
-        liveness was not requested.
+        managed host the server can wake in place. Read from the host
+        store rather than the liveness lookup, so the server sends it
+        either way; ``None`` only when an older server omits it.
     :param total_cost_usd: Cumulative priced cost over this session's
         subtree, e.g. ``11.19``. ``None`` when never priced, and also
         when usage was not requested (``usage_included=False``).
@@ -278,6 +279,20 @@ class Session:
             # Older servers predate the indicator and always aggregate usage.
             usage_included=bool(raw.get("usage_included", True)),
         )
+
+
+def _session_from_patch(resp: httpx.Response) -> Session:
+    """
+    Parse the snapshot a ``PATCH /v1/sessions/{id}`` returns.
+
+    The route always builds its snapshot without the committed-items read,
+    so the empty ``items`` it returns says nothing about the transcript.
+
+    :param resp: The PATCH response, already status-checked.
+    :returns: The snapshot with ``items_included`` marked ``False``.
+    """
+    session = Session.from_dict(require_json_object(resp, "PATCH /v1/sessions/{session_id}"))
+    return replace(session, items_included=False)
 
 
 @dataclass(frozen=True)
@@ -745,9 +760,7 @@ class SessionsNamespace:
             json={"runner_id": runner_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def unbind_runner(self, session_id: str) -> Session:
         """
@@ -768,9 +781,7 @@ class SessionsNamespace:
             json={"runner_id": ""},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_reasoning_effort(
         self,
@@ -799,9 +810,7 @@ class SessionsNamespace:
             json={"reasoning_effort": wire_effort},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_model_override(
         self,
@@ -844,9 +853,7 @@ class SessionsNamespace:
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_archived(
         self,
@@ -878,9 +885,7 @@ class SessionsNamespace:
             json={"archived": archived},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_external_session_id(
         self,
@@ -913,9 +918,7 @@ class SessionsNamespace:
             json={"external_session_id": external_session_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def list_items(
         self,
@@ -1084,8 +1087,8 @@ class SessionsNamespace:
         queued inputs — clients use this on reconnect to reconcile
         state observed via :meth:`stream`.
 
-        An orchestrator polling for lifecycle state only (has the agent
-        finished?) can skip the three expensive parts of the snapshot::
+        An orchestrator polling a session's lifecycle can skip the three
+        expensive parts of the snapshot::
 
             session = await client.sessions.get(
                 session_id, include_items=False, include_liveness=False,
@@ -1097,6 +1100,14 @@ class SessionsNamespace:
         liveness reads ``None``, and ``items_included`` is ``False``
         beside the empty ``items`` the server returns either way.
 
+        Two things ``status`` does not tell a poller. It is the session's
+        current lifecycle state, not an outcome for one submitted turn, so
+        ``"idle"`` does not prove that the turn this caller sent is the one
+        that finished; correlate a specific turn through the stream or its
+        items. And a skipped liveness lookup is not evidence the runner
+        stopped: ``runner_online`` reads ``None`` whether the runner is up
+        or down.
+
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param include_items: When ``False``, skip the committed-items
@@ -1107,7 +1118,9 @@ class SessionsNamespace:
             aggregation.
         :param refresh_state: When ``True``, refresh runner-derived
             overlays from the live session instead of serving cached
-            state. Costs a runner round-trip.
+            state. It drops the server's cached catalogs for this session,
+            which every client of it shares, so use it to recover from
+            stale state rather than on each poll.
         :returns: The current :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status (404 when the session does not exist).
