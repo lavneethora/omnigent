@@ -119,6 +119,8 @@ interface NativeShellApi {
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
   /** Re-point this window/shell to a server URL returned by the picker. */
   switchServer?: (url: string) => Promise<void>;
+  /** Sign the window's server out. Absent on shells that predate it. */
+  signOutOfServer?: () => Promise<boolean>;
   /** Return to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
   /**
@@ -198,6 +200,12 @@ interface ElectronDesktopApi extends NativeShellApi {
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
+  /** Extend this machine's running Arca instance with an approved mode. */
+  extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
+  /** Renew this machine's dbcert; Arca Companion copies it to the user's Arca and Arclets. */
+  refreshDbcert?: (options?: DbcertRefreshOptions) => Promise<DbcertRefreshResult>;
+  /** Check local credentials before an Arclet launch without starting sign-in. */
+  checkDbcert?: () => Promise<DbcertStatusResult>;
 
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
@@ -212,7 +220,13 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: {
+      force?: boolean;
+      agent?: boolean;
+      sourceHostId?: string;
+      rememberedArcaHostId?: string;
+      sourceIsArcaHost?: boolean;
+    },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
@@ -236,8 +250,19 @@ interface ElectronDesktopApi extends NativeShellApi {
 /** A lifecycle action for the host daemon. */
 export type HostControlAction = "start" | "stop" | "restart";
 
+export type ArcaExtendMode = "overnight" | "workweek";
+export type ArcaExtendResult =
+  { ok: true; shutdownAt: number | null } | { ok: false; error: string };
+export type DbcertRefreshResult = { ok: true } | { ok: false; error: string };
+export interface DbcertRefreshOptions {
+  skipArcaSync?: boolean;
+}
+export type DbcertStatusResult = { ok: true; valid: boolean } | { ok: false; error: string };
+
 /** Result of connecting the Arca instance as a host, from the desktop shell. */
 export interface ArcaConnectResult extends HostActionResult {
+  /** Actual daemon identity captured on Arca for this selected server target. */
+  identity?: { serverUrl: string; hostId: string };
   /**
    * The box's host daemon was already connected to this server (the command
    * reused it) — so no new host will appear in the host list.
@@ -266,6 +291,12 @@ export interface DesktopFeatures {
    * window's server is Databricks-managed.
    */
   databricksInternalFeatures?: boolean;
+  /** This window may offer one-click Arca extension. */
+  canExtendArca?: boolean;
+  /** This window may renew the laptop's dbcert. */
+  canRefreshDbcert?: boolean;
+  /** Shell can restore Arca preview identity after a desktop restart. */
+  arcaPreviewRecovery?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -377,6 +408,11 @@ export interface ServerPickerInfo {
   managedServers?: string[];
   /** Display names for managed servers, server URL → name. Absent on older shells. */
   managedServerNames?: Record<string, string>;
+  /**
+   * Whether the shell owns this server's sign-in (Databricks or OIDC browser
+   * sign-in) and can sign it out. Absent on older shells.
+   */
+  canSignOut?: boolean;
   /**
    * Names servers gave themselves in their manifest, origin → name. Display
    * only (a server can call itself anything), so show the host alongside.
@@ -546,6 +582,15 @@ export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
  */
 export function isMacElectronShell(): boolean {
   return isElectronShell() && navigator.userAgent.includes("Macintosh");
+}
+
+/**
+ * Mark `<html>` with `data-electron-mac` so the `[data-electron-mac]` rules
+ * reach portals outside AppShell. The shell never changes at runtime, so call
+ * once before first paint.
+ */
+export function applyMacElectronShellAttribute(): void {
+  if (isMacElectronShell()) document.documentElement.dataset.electronMac = "true";
 }
 
 /** True when running inside the iOS WKWebView native shell. */
@@ -882,6 +927,22 @@ export async function switchServer(url: string): Promise<void> {
 }
 
 /**
+ * Ask the native shell to sign this window's server out. Every window on that
+ * server returns to the setup page, and the next Connect signs in through the
+ * browser. Resolves false off-shell or when the shell can't sign it out.
+ */
+export async function signOutOfServer(): Promise<boolean> {
+  const native = nativeApi();
+  if (!native?.signOutOfServer) return false;
+  try {
+    return (await native.signOutOfServer()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] native signOutOfServer failed:", err);
+    return false;
+  }
+}
+
+/**
  * Ask the native shell to return this window to its "connect to server"
  * setup page (the picker's "+ Connect to new server…" action). The window
  * navigates away on success.
@@ -973,6 +1034,58 @@ export async function connectArcaHost(): Promise<ArcaConnectResult> {
   } catch (err) {
     console.warn("[nativeBridge] electron connectArcaHost failed:", err);
     return { ok: false, error: String(err) };
+  }
+}
+
+/** Present only in desktop shells that can extend a running Arca instance. */
+export function hasArcaExtendBridge(): boolean {
+  return typeof electronApi()?.extendArca === "function";
+}
+
+export async function extendArca(mode: ArcaExtendMode): Promise<ArcaExtendResult> {
+  const bridge = electronApi()?.extendArca;
+  if (!bridge) return { ok: false, error: "Arca extend is unavailable in this app." };
+  try {
+    return await bridge(mode);
+  } catch (error) {
+    console.warn("[nativeBridge] electron extendArca failed:", error);
+    return {
+      ok: false,
+      error: "Could not extend Arca from this app.",
+    };
+  }
+}
+
+/** Present only in desktop shells that can renew this machine's dbcert. */
+export function hasDbcertRefreshBridge(): boolean {
+  return typeof electronApi()?.refreshDbcert === "function";
+}
+
+export function hasDbcertPreflightBridge(): boolean {
+  return typeof electronApi()?.checkDbcert === "function" && hasDbcertRefreshBridge();
+}
+
+/** Check the laptop's credentials without opening a browser or renewing them. */
+export async function checkDbcert(): Promise<DbcertStatusResult> {
+  const bridge = electronApi()?.checkDbcert;
+  if (!bridge) return { ok: false, error: "Laptop credential checks are unavailable in this app." };
+  try {
+    return await bridge();
+  } catch (error) {
+    console.warn("[nativeBridge] electron checkDbcert failed:", error);
+    return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
+  }
+}
+
+/** Renew the laptop's dbcert through the desktop shell, which runs `dbcert --force`. */
+export async function refreshDbcert(options?: DbcertRefreshOptions): Promise<DbcertRefreshResult> {
+  const bridge = electronApi()?.refreshDbcert;
+  if (!bridge) return { ok: false, error: "dbcert refresh is unavailable in this app." };
+  try {
+    return await (options ? bridge(options) : bridge());
+  } catch (error) {
+    console.warn("[nativeBridge] electron refreshDbcert failed:", error);
+    return { ok: false, error: "Could not run dbcert from this app." };
   }
 }
 
